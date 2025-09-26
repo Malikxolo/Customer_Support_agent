@@ -15,7 +15,6 @@ class LLMConfig:
     provider: str
     model: str
     api_key: str
-    temperature: float = 0.7
     max_tokens: int = 4000
     timeout: int = 30
     base_url: Optional[str] = None
@@ -89,7 +88,7 @@ class Config:
         return self.available_web_models.copy()
     
     def create_llm_config(self, provider: str, model: str, 
-                         temperature: float = 0.7, max_tokens: int = 4000) -> LLMConfig:
+                        max_tokens: int = 4000) -> LLMConfig:
         """Create LLM configuration for any provider/model combination"""
         
         if provider not in self.available_providers:
@@ -110,7 +109,6 @@ class Config:
             provider=provider,
             model=model,
             api_key=api_key,
-            temperature=temperature,
             max_tokens=max_tokens,
             base_url=base_url
         )
