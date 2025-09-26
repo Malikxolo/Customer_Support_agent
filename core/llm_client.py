@@ -6,7 +6,10 @@ Simplified version to avoid import issues
 import asyncio
 import aiohttp
 import json
+import logging
 from typing import Dict, List, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 class LLMClient:
     """Universal async LLM client with multi-provider support"""
@@ -35,16 +38,18 @@ class LLMClient:
             self.session = None
     
     async def generate(self, messages: List[Dict[str, str]], 
+                      temperature: float,                       # ✅ REQUIRED parameter
                       system_prompt: Optional[str] = None,
-                      temperature: Optional[float] = None,
                       max_tokens: Optional[int] = None) -> str:
         """Generate response using configured LLM"""
+        
+        logger.info(f"🤖 API call: {self.config.provider}/{self.config.model}")
         
         if not self.session:
             await self.start_session()
         
-        temp = temperature if temperature is not None else getattr(self.config, 'temperature', 0.7)
-        tokens = max_tokens if max_tokens is not None else getattr(self.config, 'max_tokens', 4000)
+        temp = temperature
+        tokens = max_tokens if max_tokens is not None else self.config.max_tokens
         
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}] + messages
@@ -57,6 +62,7 @@ class LLMClient:
             else:
                 raise Exception(f"Unsupported provider: {self.config.provider}")
         except Exception as e:
+            logger.error(f"❌ 🤖 Generation failed: {type(e).__name__}: {str(e)}")
             raise Exception(f"Generation failed: {e}")
     
     async def _anthropic_request(self, messages: List[Dict[str, str]], 
@@ -94,8 +100,11 @@ class LLMClient:
             json=payload
         ) as response:
             
+            logger.info(f"🤖 Anthropic response status: {response.status}")
+            
             if response.status != 200:
                 error_text = await response.text()
+                logger.error(f"❌ 🤖 Anthropic API error: {response.status}: {error_text}")
                 raise Exception(f"API error {response.status}: {error_text}")
             
             result = await response.json()
@@ -128,15 +137,19 @@ class LLMClient:
         
         async with self.session.post(url, headers=headers, json=payload) as response:
             
+            logger.info(f"🤖 {self.config.provider} response status: {response.status}")
+            
             response_text = await response.text()
             
             if response.status != 200:
+                logger.error(f"❌ 🤖 {self.config.provider} API error: {response.status}: {response_text}")
                 raise Exception(f"API error {response.status}: {response_text}")
             
             # Safe JSON parsing with better error handling
             try:
                 result = json.loads(response_text)
             except json.JSONDecodeError as e:
+                logger.error(f"❌ 🤖 JSON parse error: {response_text[:100]}...")
                 raise Exception(f"Invalid JSON from {self.config.provider}: '{response_text[:200]}...' Error: {e}")
             
             return result["choices"][0]["message"]["content"]
@@ -146,6 +159,5 @@ class LLMClient:
         return {
             "provider": self.config.provider,
             "model": self.config.model,
-            "temperature": str(getattr(self.config, 'temperature', 0.7)),
-            "max_tokens": str(getattr(self.config, 'max_tokens', 4000))
+            "max_tokens": str(self.config.max_tokens)
         }
