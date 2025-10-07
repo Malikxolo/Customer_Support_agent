@@ -254,9 +254,22 @@ Perform ALL of the following analyses in ONE response:
 6. DEPENDENCY & QUERY OPTIMIZATION:
 
     Step 1: If 2+ tools selected, detect dependencies
-    - Does any tool need output from another tool to work?
-    - If YES: mode="sequential", order=[first_tool, second_tool, third_tool, ...]
-    - If NO: mode="parallel"
+
+    Look at the USER'S QUERY and the tools you selected.
+
+    Ask: "Does the user's question require information from BOTH tools to be combined/compared?"
+
+    Examples:
+    - "What is X and who are X's competitors" → YES (need to know what X is to find relevant competitors)
+    - "Calculate cost of 10 stocks" → YES (need stock price to calculate)
+    - "What is X and what is Y" → NO (two separate questions)
+
+    If YES → mode="sequential"
+    - Put the tool that fetches base information first
+    - Put the tool that needs that information second
+
+    If NO → mode="parallel"
+
 
     Step 2: Generate queries based on POSITION in order array
 
@@ -593,24 +606,27 @@ Return ONLY valid JSON:
     Return ONLY a valid math expression (e.g., "20000 - 500"). If no clear numbers found, return "SKIP"."""
         
         else:
-            # YOUR EXISTING WEB SEARCH LOGIC (KEEP AS-IS)
-            middleware_prompt = f"""Extract key information and create an enhanced search query.
+           middleware_prompt = f"""Create a GENERIC industry search query based on previous data.
 
-    ORIGINAL USER QUERY: {original_query}
+        ORIGINAL USER QUERY: {original_query}
 
-    PREVIOUS TOOL RESULTS:
-    {previous_summary}
+        PREVIOUS TOOL RESULTS:
+        {previous_summary}
 
-    NEXT TOOL: {next_tool}
+        Your task: Create a GENERIC industry search query.
+        Extract ONLY category/technology/use case (NOT specific company/product names).
 
-    Your task: Extract the main product/entity name, category, and key features from the results above, then create a focused search query for {next_tool}.
+        Examples:
+        - Query: "compare competitors", Data: "CompanyX is a customer support chatbot for WhatsApp"
+        → "customer support chatbot WhatsApp competitors 2025"
 
-    Examples:
-    - If results mention "Mochand is a customer support chatbot for WhatsApp" → "customer support chatbot WhatsApp competitors 2025"
-    - If results mention "Our CRM system helps sales teams" → "CRM systems sales teams alternatives 2025"
-    - If results mention "AI-powered email automation tool" → "AI email automation tools competitors 2025"
+        - Query: "compare pricing", Data: "Product Y is an AI chatbot builder platform"
+        → "AI chatbot builder pricing comparison 2025"
 
-    Return ONLY the search query, nothing else. Keep it focused and under 10 words."""
+        - Query: "compare features", Data: "Our CRM system for sales teams"
+        → "CRM sales teams features comparison 2025"
+
+        Return ONLY the search query, nothing else. Keep it focused and under 10 words."""
         
         try:
             logger.info(f"🔄 Calling middleware LLM...")
