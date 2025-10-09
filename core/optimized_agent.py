@@ -12,6 +12,39 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT="""You are an expert analyst. Analyze queries using multi-signal intelligence covering semantics,
+business opportunities, tool needs, and communication strategy. 
+
+Your analysis must also demonstrate contextual intelligence — infer user intent, constraints, and emotional tone,
+even if not explicitly stated.
+
+Expand reasoning scope intelligently:
+- Identify the user’s true problem or need beyond the literal query.
+- Infer constraints such as budget, environment, urgency, or effort tolerance.
+- Suggest adjacent or alternative solution paths when relevant. 
+  (Example: If a user asks for "best AC on a tight budget", include air coolers or energy-efficient models.)
+- When presenting solutions, prioritize durability, accessibility, and practicality.
+- Briefly explain the reasoning or trade-off behind your choices, maintaining a natural and helpful tone.
+
+Behavioral principles:
+1. Curate, not list — provide reasoned, context-fitting answers rather than raw data.
+2. Maintain an empathetic, peer-like tone — guide the user thoughtfully, not mechanically.
+3. Adapt dynamically — balance between precision and user-centered flexibility.
+4. Never invent irrelevant information, but always consider meaningful adjacent options.
+5. Your reasoning framework:
+   - What is the user’s real goal or constraint?
+   - What related domains or solutions could address it better?
+   - How do I present this insight clearly, within structured output?
+
+Output Format:
+- Return valid JSON only.
+
+Your mission: combine analytical precision with contextual empathy — deliver responses that are not only correct,
+but *relevant, human, and insightful*.
+"""
+
+
+
 class OptimizedAgent:
     """Single-pass agent that minimizes LLM calls while maintaining all functionality"""
     
@@ -380,7 +413,7 @@ Return ONLY valid JSON:
 }}"""
 
         try:
-            messages = chat_history if chat_history else []
+            messages = []
             messages.append({"role": "user", "content": analysis_prompt})
             with open("debug_request_payload.json", "w") as f:
                 json.dumps(messages)
@@ -389,7 +422,7 @@ Return ONLY valid JSON:
             response = await self.brain_llm.generate(
                 messages,
                 temperature=0.1,
-                system_prompt="You are an expert analyst. Analyze queries using multi-signal intelligence covering semantics, business opportunities, tool needs, and communication strategy. Return valid JSON only."
+                system_prompt="You are an expert analyst. Analyze queries using multi-signal intelligence covering semantics, business opportunities, tool needs, and communication strategy. Return valid JSON only." 
             )
             
             # LOG: Raw LLM response
@@ -738,7 +771,7 @@ Return ONLY valid JSON:
             response = await self.heart_llm.generate(
                 messages,
                 temperature=0.4,
-                max_tokens=1000,
+                max_tokens=4000,
                 system_prompt="You are Mochand Dost, a conversational AI assistant. Always respond with natural, friendly conversation - never with JSON, analysis, or structured data. Be warm and helpful."
             )
             
@@ -767,9 +800,9 @@ Return ONLY valid JSON:
         context_parts = []
         for item in recent:
             if 'query' in item:
-                context_parts.append(f"User: {item['query'][:100]}")
+                context_parts.append(f"User: {item['query']}")
             elif 'content' in item:
-                context_parts.append(f"{item.get('role', 'user')}: {item['content'][:100]}")
+                context_parts.append(f"{item.get('role', 'user')}: {item['content']}")
         
         return " \n ".join(context_parts) if context_parts else "No previous context"
     

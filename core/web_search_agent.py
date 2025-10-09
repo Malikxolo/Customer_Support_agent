@@ -34,7 +34,7 @@ async def search_perplexity(query: str, model: str = 'perplexity/sonar') -> str:
     """
     try:
         logger.info(f"Searching with model {model} for query: {query[:100]}...")
-        
+        modified_query = f"{query}\n\nPlease provide sources for your answer. Also suggest alternatives if applicable."
         # Validate API key
         if not getenv('OPENROUTER_API_KEY'):
             raise Exception("OPENROUTER_API_KEY not found in environment variables")
@@ -52,7 +52,7 @@ async def search_perplexity(query: str, model: str = 'perplexity/sonar') -> str:
         
         messages = [{
             "role": "user",
-            "content": query
+            "content": modified_query
         }]
         
         completion = await client.chat.completions.create(
