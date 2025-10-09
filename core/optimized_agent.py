@@ -24,7 +24,7 @@ class OptimizedAgent:
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
         """Process query with minimal LLM calls"""
-        logger.info(f"🚀 PROCESSING QUERY: '{query[:50]}...'")
+        logger.info(f"🚀 PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
         
         logger.info(f"🔍 DEBUG CHAT HISTORY:")
@@ -192,52 +192,60 @@ AVAILABLE TOOLS:
 Perform ALL of the following analyses in ONE response:
 
 1. SEMANTIC INTENT (what user really wants)
-   - What is the user actually asking for? Preserve specific details from query:
-        demographics (age/gender), location, platforms, urgency words, price ranges.
-   - Does this need current/live information that changes over time?
-   - What's their emotional state and communication style?
+   - What is the user trying to accomplish?
+     * Solve a problem? (seeking solutions/recommendations)
+     * Get information? (factual query, price check, comparison)
+     * Learn something? (educational/conceptual)
+     * Chat casually? (greetings, small talk)
+   
+   - If solving a problem:
+     * What problem are they facing?
+     * What solution did they mention, if any?
+     * What constraints do they have? (budget, location, urgency, maintenance, experience)
+   
+   - Final intent: Based on the above, what should we help them with?
+   
+   Preserve ALL specific details: demographics, location, platforms, urgency, budget, preferences.
 
 2. MOCHAND PRODUCT OPPORTUNITY ANALYSIS:
-   Does the user's query relate to problems that Mochand's AI chatbot solution can solve?
 
-   MOCHAND-SPECIFIC TRIGGERS (check for these pain points):
-   - Customer support automation needs
-   - High customer service costs or staff burden 
-   - Need for 24/7 customer availability
-   - Multiple messaging platform management difficulties (WhatsApp, Facebook, Instagram)
-   - Repetitive customer query handling
-   - Customer engagement/response time issues
-   - Integration needs with CRM/payment systems for customer communication
-   - Scaling customer communication challenges
-
-   Set business_opportunity.detected = true if query shows ANY of:
-   - User states a current problem/challenge
-   - User is actively seeking/evaluating solutions
-   - User expresses dissatisfaction with current situation
-   - User mentions "need", "looking for", "considering", "want to improve"
-
-   DO NOT trigger business_opportunity.detected = true for:
-   - Pure research/comparison without context ("Compare X vs Y")
-   - Definition questions ("What is X")
-   - General knowledge inquiries
-
-   If business opportunity detected:
-   - Set business_opportunity.detected = true
-   - Add "rag" to tools_to_use (fetch Mochand product docs)
-
-   If query is about other business areas (accounting, inventory, website, etc.):
-   - Set business_opportunity.detected = false
+   WHAT MOCHAND DOES (context for understanding):
+   - AI chatbot for customer communication automation
+   - Supports WhatsApp, Facebook, Instagram messaging
+   - Automates customer support, 24/7 availability
+   - Handles repetitive customer queries
+   - Integrates with CRM/payment systems
+   
+   DECISION LOGIC (strict matching):
+   Step 1: Does query contain these EXACT keywords?
+   - "customer" OR "client" OR "support" OR "service" OR "chat" OR "messaging" OR "communication"
+   
+   Step 2: Is user seeking solutions (not definitions)?
+   
+   If BOTH YES → business_opportunity.detected = true
+   Otherwise → business_opportunity.detected = false
+   
+   EXCLUDE (even if problems mentioned):
+   - Vague queries without keywords ("maintaining business", "business troubles")  
+   - Other domains: accounting, inventory, HR, logistics
 
 3. TOOL SELECTION:
-   - What tools are needed? (can be multiple or none)
-   - STEP-BY-STEP TOOL SELECTION:
-        1. What information is needed to answer this query?
-        2. Where can that information come from?
-        3. What processing/analysis is required?
-        4. Select appropriate tools based on these needs
-   - Use NO tools for: 
-     * Greetings, thanks, casual chat
-     * General knowledge questions (e.g., "Python vs JavaScript", "How to code", "What is AI")
+
+   RAG SELECTION (STRICT RULE):
+   Select rag ONLY if query is ABOUT Mochand itself:
+   - Query mentions: "Mochand", "our/your product", "this chatbot", "what can you do"
+   - Or asks about your capabilities/features
+   
+   If query is about OTHER topics (AC, laptops, general business) → NO rag
+   
+   GENERAL TOOL SELECTION:
+   - What information is needed?
+   - Where can it come from?
+   - Select appropriate tools
+   
+   Use NO tools for:
+   - Greetings, casual chat
+   - General knowledge questions
 
 4. SENTIMENT & PERSONALITY:
    - User's emotional state (frustrated/excited/casual/urgent/confused)
@@ -251,21 +259,16 @@ Perform ALL of the following analyses in ONE response:
 
     Step 1: If 2+ tools selected, detect dependencies
 
-    Look at the USER'S QUERY and the tools you selected.
-
-    Ask: "Does the user's question require information from BOTH tools to be combined/compared?"
-
-    Examples:
-    - "What is X and who are X's competitors" → YES (need to know what X is to find relevant competitors)
-    - "Calculate cost of 10 stocks" → YES (need stock price to calculate)
-    - "What is X and what is Y" → NO (two separate questions)
-
-    If YES → mode="sequential"
-    - Put the tool that fetches base information first
-    - Put the tool that needs that information second
-
-    If NO → mode="parallel"
-
+    DEFAULT = PARALLEL (tools run independently)
+    
+    Use SEQUENTIAL only if you cannot write a complete query for a tool without another tool's output.
+    
+    Test: Can I write queries for ALL tools using only the user's query right now?
+    - YES → PARALLEL
+    - NO (need to wait for results) → SEQUENTIAL
+    
+    If YES → mode="parallel"
+    If NO → mode="sequential"
 
     Step 2: Generate queries based on POSITION in order array
 
@@ -333,8 +336,6 @@ Perform ALL of the following analyses in ONE response:
         "rag": "Mochand product information"
     }}
     }}
-
-
 
 Return ONLY valid JSON:
 {{
@@ -712,13 +713,7 @@ Return ONLY valid JSON:
     - If user asks specific question → Provide info, optional question
     - If user seems to want guidance → Ask clarifying question
     - If providing detailed data → Just end with the info
-    - Mix question and non-question endings for natural flow
-    7. ONLY use information from the available data above - never add facts not provided
-    
-    Be specific when data is specific:
-    ✗ "Some companies..." → ✓ "Apple, Samsung, Xiaomi..."
-    ✗ "Market is growing..." → ✓ "Growing 23% CAGR to $46B by 2029..."
-    ✗ "Several symptoms..." → ✓ "Fever, lethargy, loss of appetite..."
+    - Mix question and non-question endings for natural flow 
 
     USER QUERY: {query}
 
