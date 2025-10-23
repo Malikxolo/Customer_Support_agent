@@ -12,6 +12,12 @@ from core import (
     ToolManager, Config, BrainAgent
 )
 from core.optimized_agent import OptimizedAgent
+from core.logging_security import (
+    safe_log_response,
+    safe_log_user_data,
+    safe_log_error,
+    safe_log_query
+)
 import json
 import shutil
 import asyncio
@@ -243,8 +249,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         chat_history = request.chat_history if hasattr(request, 'chat_history') else []
         
         
-        logging.info(f"🧠❤️ Brain-Heart chat request - User ID: {user_id}")
-        logging.info(f"🧠❤️ Message count: {len(user_query)}")
+        safe_log_user_data(user_id, 'brain_heart_chat', message_count=len(user_query))
         
         brain_provider = settings.brain_provider or os.getenv("BRAIN_LLM_PROVIDER")
         brain_model = settings.brain_model or os.getenv("BRAIN_LLM_MODEL")
@@ -296,8 +301,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         
         if result["success"]:
             
-            logging.info(f"✅ Brain-Heart response generated in {result.get('total_time', 0):.2f} seconds")
-            logging.info(f"🧠 Brain-Heart response: {result['response']}")
+            safe_log_response(result, level='info')
             return JSONResponse(content=result, status_code=200)
         else:
             return JSONResponse(
@@ -375,9 +379,9 @@ async def chat_single_query_legacy(query: str = Body(...), user_id: str = Body(.
         return await chat_brain_heart_system(mock_request)
         
     except Exception as e:
-        logging.error(f"❌ Single query processing failed: {str(e)}")
+        safe_log_error(e, context={'endpoint': 'single_query_processing'})
         return JSONResponse(
-            content={"error": f"Single query processing failed: {str(e)}"}, 
+            content={"error": "Single query processing failed"}, 
             status_code=500
         )
         
