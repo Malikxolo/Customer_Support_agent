@@ -1,936 +1,1819 @@
 """
-Google Drive Integration with Multi-Account Session Token Management
-Professional UI with enhanced security and file conflict handling
-STREAMLIT CLOUD OPTIMIZED VERSION
-SECURITY: Path sanitization to prevent directory traversal attacks
+Brain-Heart Deep Research System - Streamlit Application
+FIXED VERSION - Proper model selection flow
 """
 
+import streamlit as st
+import asyncio
+import json
+import time
+import uuid
 import os
 import shutil
+import threading
 import logging
-from typing import List, Dict, Any, Optional
-import streamlit as st
-from core.session_manager import SessionTokenManager, MultiAccountManager
-from core.path_security import (
-    sanitize_path_component,
-    sanitize_filename,
-    validate_safe_path,
-    create_safe_user_path
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+import sys
+import logging.config
+import requests
+from chroma_log_handler import ChromaLogHandler
+from dotenv import load_dotenv
+import aiohttp
+from core.google_drive_integration import render_multi_account_drive_picker, cleanup_multi_account_session
+from core.organization_manager import (
+    create_organization, 
+    join_organization, 
+    check_permission,
+    get_organization,
+    org_manager
 )
-import uuid
-import hashlib
-import json  # ← ADD THIS IMPORT
-import time  # ← ADD THIS IMPORT
 
-# Google Drive API imports
-try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import Flow
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
-    import io
-    GOOGLE_DRIVE_AVAILABLE = True
-except ImportError:
-    GOOGLE_DRIVE_AVAILABLE = False
+
+load_dotenv()
+
+def upload_local_files(user_id: str, collection_name: str, files):
+
+    url = "http://localhost:8030/api/collections/create/local"
+    form_data = {
+        "user_id": user_id,
+        "collection_name": collection_name,
+    }
+    files_data = [
+        ("files", (uploaded_file.name, uploaded_file.read(), uploaded_file.type or "application/octet-stream"))
+        for uploaded_file in files
+    ]
+
+    response = requests.post(url, data=form_data, files=files_data)
+    return response.json()
+
+async def mog_query(user_id: str, chat_history:List, query: str):
+    url = "http://localhost:8030/api/chat"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "userid": user_id,
+        "chat_history": chat_history,
+        "user_query": query
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            response_data = await response.json()
+            return response_data
+
+
+# Initialize user_id FIRST (before logging)
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())
+    
+if 'org_id' not in st.session_state:
+    st.session_state.org_id = None
+    
+if 'org_role' not in st.session_state:
+    st.session_state.org_role = None
+    
+if 'user_name' not in st.session_state:
+    st.session_state.user_name = None
+    
+if 'show_create_org' not in st.session_state:
+    st.session_state.show_create_org = False
+    
+if 'show_join_org' not in st.session_state:
+    st.session_state.show_join_org = False
+    
+if 'show_transfer_admin' not in st.session_state:
+    st.session_state.show_transfer_admin = False
+
+if 'team_id' not in st.session_state:
+    st.session_state.team_id = None  
+
+if 'selected_team_id' not in st.session_state:
+    st.session_state.selected_team_id = None  
+
+if 'show_create_team_dialog' not in st.session_state:
+    st.session_state.show_create_team_dialog = False
+    
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(name)s %(levelname)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('error.log', encoding='utf-8', errors='replace')
+    ],
+    force=True  # Override any existing configuration
+)
+
+# Set specific loggers
+logging.getLogger('core.google_drive_integration').setLevel(logging.INFO)
+logging.getLogger('core.knowledge_base').setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
-SCOPES = [
-    'https://www.googleapis.com/auth/drive.readonly',
-    'https://www.googleapis.com/auth/userinfo.email',
-    'openid'
-]
-
-# ✅ ADD THIS CLASS BEFORE MultiAccountGoogleDriveManager
-class UserIsolatedOAuthStateManager:
-    """User-isolated OAuth state management for multi-user cloud deployment"""
+def cleanup_expired_sessions():
+    """Clean up expired sessions - REMOVES ENTIRE FOLDERS"""
+    from core.session_manager import SessionTokenManager
     
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-        # SECURITY: Sanitize user_id for directory creation
-        safe_user_id = hashlib.md5(user_id.encode()).hexdigest()
-        # Create user-specific state directory for perfect isolation
-        self.user_state_dir = create_safe_user_path("oauth_states", safe_user_id)
-        os.makedirs(self.user_state_dir, exist_ok=True)
+    sessions_dir = "sessions"
+    if not os.path.exists(sessions_dir):
+        logger.info("No sessions to clean")
+        return
     
-    def create_state(self, state_value: str) -> str:
-        """Store state in user-isolated directory"""
-        state_id = hashlib.md5(f"{self.user_id}_{time.time()}_{state_value}".encode()).hexdigest()[:16]
-        state_data = {
-            'state': state_value,
-            'user_id': self.user_id,
-            'created_at': time.time(),
-            'expires_at': time.time() + 1800  # 30 minutes
-        }
-        # SECURITY: Validate path before writing
-        state_file = validate_safe_path(self.user_state_dir, f"{state_id}.json")
-        with open(state_file, 'w') as f:
-            json.dump(state_data, f)
-        return state_id
+    logger.info("Starting session cleanup...")
+    current_time = datetime.now(timezone.utc)
+    cleaned_count = 0
     
-    def verify_and_consume_state(self, state_id: str, received_state: str) -> bool:
-        """Verify state with strict user isolation and one-time use"""
-        try:
-            # SECURITY: Validate state file path
-            state_file = validate_safe_path(self.user_state_dir, f"{state_id}.json")
-            
-            if not os.path.exists(state_file):
-                logger.error(f"State file not found for user {self.user_id}: {state_id}")
-                return False
-            
-            with open(state_file, 'r') as f:
-                state_data = json.load(f)
-            
-            # STRICT USER ISOLATION CHECK
-            if state_data.get('user_id') != self.user_id:
-                logger.error(f"User ID mismatch! Expected: {self.user_id}, Got: {state_data.get('user_id')}")
-                os.remove(state_file)
-                return False
-            
-            # Check expiration
-            if time.time() > state_data['expires_at']:
-                logger.error(f"State expired for user {self.user_id}")
-                os.remove(state_file)
-                return False
-            
-            # Verify state matches
-            if state_data['state'] != received_state:
-                logger.error(f"State mismatch for user {self.user_id}")
-                os.remove(state_file)
-                return False
-            
-            # SUCCESS: Consume the state (one-time use)
-            os.remove(state_file)
-            logger.info(f"✅ State verified and consumed for user {self.user_id}")
-            return True
-            
-        except ValueError as ve:
-            logger.error(f"Security validation failed for user {self.user_id}: {ve}")
-            return False
-        except Exception as e:
-            logger.error(f"State verification failed for user {self.user_id}: {e}")
-            return False
-
-class MultiAccountGoogleDriveManager:
-    """Multi-account Google Drive manager - STREAMLIT CLOUD OPTIMIZED"""
-    
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-        self.base_temp_path = "temp_drive_files"
-        self.account_manager = MultiAccountManager(user_id)
+    for user_id in os.listdir(sessions_dir):
+        user_path = os.path.join(sessions_dir, user_id)
+        if not os.path.isdir(user_path):
+            continue
         
-        logger.debug(f"🚀 MultiAccountGoogleDriveManager initialized for user: {user_id}")
-
-    def is_available(self) -> bool:
-        """Check if Google Drive integration is available - CLOUD COMPATIBLE"""
-        if not GOOGLE_DRIVE_AVAILABLE:
-            logger.error("🔍 Google Drive libraries not available")
-            return False
+        logger.info(f"🔍 Checking user: {user_id}")
         
-        # Check if secrets are configured (ROOT LEVEL)
-        try:
-            if (hasattr(st, 'secrets') and 
-                'GOOGLE_OAUTH_CLIENT_ID' in st.secrets and 
-                'GOOGLE_OAUTH_CLIENT_SECRET' in st.secrets):
-                logger.info("🔍 CLOUD: Google Drive available via secrets")
-                return True
-            else:
-                logger.error("🔍 CLOUD: Google OAuth secrets not configured")
-                return False
-        except Exception as e:
-            logger.error(f"🔍 CLOUD: Error checking secrets: {e}")
-            return False
-
-    def authenticate_account(self, account_alias: str = None) -> Optional[str]:
-        """Cloud-compatible authentication using web flow with user isolation"""
-        try:
-            account_id = str(uuid.uuid4())[:8]
-            account_alias = account_alias or f"Account {len(self.account_manager.get_user_accounts()) + 1}"
-            
-            logger.info(f"🌐 CLOUD: Starting web flow for: {account_alias}")
-            
-            # Get credentials from Streamlit secrets
+        # Get all session files
+        session_files = [f for f in os.listdir(user_path) if f.startswith('session_') and f.endswith('.json')]
+        
+        if not session_files:
+            # Empty folder - remove it
+            logger.info(f"🗑️ Empty user folder found: {user_id}")
             try:
-                client_config = {
-                    "web": {
-                        "client_id": st.secrets["GOOGLE_OAUTH_CLIENT_ID"],
-                        "client_secret": st.secrets["GOOGLE_OAUTH_CLIENT_SECRET"],
-                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                        "token_uri": "https://oauth2.googleapis.com/token"
-                    }
-                }
-                logger.info("🌐 CLOUD: Retrieved client config from secrets")
+                shutil.rmtree(user_path)
+                cleaned_count += 1
+                logger.info(f"✅ Removed empty user folder: {user_id}")
             except Exception as e:
-                logger.error(f"🌐 CLOUD: Failed to get secrets: {e}")
-                st.error("❌ OAuth credentials not configured in Streamlit secrets")
-                return None
+                logger.error(f"❌ Failed to remove empty folder {user_id}: {e}")
+            continue
+        
+        # Check each session file
+        user_expired = False
+        for filename in session_files:
+            account_id = filename.replace('session_', '').replace('.json', '')
+            session_file = os.path.join(user_path, filename)
             
-            # Construct redirect URI with trailing slash
+            logger.info(f"🔍 Checking session: {user_id}/{account_id}")
+            
             try:
-                app_url = f"https://{st.secrets['STREAMLIT_APP_NAME']}.streamlit.app"
-                redirect_uri = f"{app_url}/"
-                logger.info(f"🌐 CLOUD: Using redirect URI: {redirect_uri}")
-            except Exception as e:
-                logger.error(f"🌐 CLOUD: Failed to construct app URL: {e}")
-                st.error("❌ STREAMLIT_APP_NAME not configured in secrets")
-                return None
+                # Read session file in binary mode
+                with open(session_file, 'rb') as f:
+                    encrypted_data = f.read()
+                
+                # Try to decrypt (TTL check)
+                session_mgr = SessionTokenManager(user_id, account_id)
+                decrypted_data = session_mgr._decrypt_data(encrypted_data)
+                
+                if not decrypted_data:
+                    # TTL expired - mark for deletion
+                    logger.info(f"🗑️ Session TTL expired: {user_id}/{account_id}")
+                    user_expired = True
+                    break
+                else:
+                    # Session still valid - keep user
+                    logger.info(f"✅ Session valid: {user_id}/{account_id}")
+                    user_expired = False
+                    break
             
-            # Create OAuth Flow
+            except Exception as e:
+                logger.info(f"🗑️ Session read error (expired): {user_id}/{account_id} - {e}")
+                user_expired = True
+                break
+        
+        # Delete user folder if expired
+        if user_expired:
             try:
-                flow = Flow.from_client_config(
-                    client_config, 
-                    SCOPES,
-                    redirect_uri=redirect_uri
-                )
-                logger.info("🌐 CLOUD: Created Flow successfully")
-            except Exception as e:
-                logger.error(f"🌐 CLOUD: Failed to create Flow: {e}")
-                return None
-            
-            # Check current URL for OAuth callback
-            current_url_params = dict(st.query_params)
-            logger.info(f"🌐 CLOUD: Current URL params: {current_url_params}")
-            
-            # ✅ CORRECTED: Check for OAuth callback (NO sid requirement!)
-            if 'code' in current_url_params and 'state' in current_url_params:
-                logger.info("🌐 CLOUD: Processing OAuth callback...")
+                logger.info(f"🗑️ Removing expired user folder: {user_id}")
                 
-                authorization_code = current_url_params['code']
-                received_state = current_url_params['state']
-                
-                logger.info(f"🌐 CLOUD: Received code: {authorization_code[:20]}...")
-                logger.info(f"🌐 CLOUD: Received state: {received_state}")
-                
-                # ✅ CORRECTED: User-isolated state verification by lookup
-                state_manager = UserIsolatedOAuthStateManager(self.user_id)
-                state_verified = False
-                
+                # Try to revoke tokens first
                 try:
-                    if os.path.exists(state_manager.user_state_dir):
-                        logger.info(f"🌐 CLOUD: Looking for state in {state_manager.user_state_dir}")
-                        
-                        for filename in os.listdir(state_manager.user_state_dir):
-                            if filename.endswith('.json'):
-                                try:
-                                    filepath = os.path.join(state_manager.user_state_dir, filename)
-                                    with open(filepath, 'r') as f:
-                                        state_data = json.load(f)
-                                    
-                                    logger.info(f"🌐 CLOUD: Checking state file: {filename}")
-                                    logger.info(f"🌐 CLOUD: Stored state: {state_data.get('state', 'None')}")
-                                    
-                                    # Check if this is the matching state
-                                    if (state_data.get('state') == received_state and 
-                                        state_data.get('user_id') == self.user_id):
-                                        
-                                        # Verify it's not expired
-                                        if time.time() <= state_data['expires_at']:
-                                            # SUCCESS - consume the state (one-time use)
-                                            os.remove(filepath)
-                                            state_verified = True
-                                            logger.info(f"✅ CLOUD: State verified and consumed for user {self.user_id}")
-                                            break
-                                        else:
-                                            # Expired - remove it
-                                            os.remove(filepath)
-                                            logger.error(f"🌐 CLOUD: State expired for user {self.user_id}")
-                                            break
-                                except Exception as file_error:
-                                    logger.warning(f"🌐 CLOUD: Error reading state file {filename}: {file_error}")
-                                    continue
-                    else:
-                        logger.error(f"🌐 CLOUD: State directory doesn't exist: {state_manager.user_state_dir}")
+                    for filename in session_files:
+                        account_id = filename.replace('session_', '').replace('.json', '')
+                        session_mgr = SessionTokenManager(user_id, account_id)
+                        session_mgr.revoke_google_tokens()
+                        logger.info(f"🔒 Revoked tokens: {user_id}/{account_id}")
+                except Exception as revoke_error:
+                    logger.warning(f"Token revocation failed (continuing): {revoke_error}")
+                
+                # Delete the folder
+                shutil.rmtree(user_path)
+                cleaned_count += 1
+                logger.info(f"✅ Deleted expired user folder: {user_id}")
+                
+            except Exception as delete_error:
+                logger.error(f"❌ Failed to delete {user_id}: {delete_error}")
+        else:
+            logger.info(f"✅ Keeping user: {user_id}")
+    
+    logger.info(f"Cleanup completed: {cleaned_count} users removed")
+
+
+
+
+@st.cache_resource
+def start_agent_background_worker(_agent):
+    """Start agent's background memory worker - FIXED VERSION"""
+    try:
+        # Create a dedicated event loop for the background worker thread
+        # This loop will persist and won't interfere with main thread loops
+        def run_worker():
+            # Create a new loop for this thread
+            logger.info("Starting agent background worker thread...")
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+            
+            try:
+                worker_loop.run_until_complete(_agent.background_task_worker())
+            except Exception as e:
+                logger.error(f"Background worker error: {e}")
+            finally:
+                # Clean up this thread's loop
+                try:
+                    pending = asyncio.all_tasks(worker_loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception as cleanup_error:
+                    logger.warning(f"Worker cleanup warning: {cleanup_error}")
+                finally:
+                    worker_loop.close()
+        
+        # Start the worker in a daemon thread
+        thread = threading.Thread(target=run_worker, daemon=True)
+        thread.start()
+        logger.info("✅ Agent background worker started with isolated event loop")
+        return "started"
+    
+    except Exception as e:
+        logger.error(f"Failed to start agent worker: {e}")
+        return None
+
+
+def get_user_id():
+    """Get or create user ID"""
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = str(uuid.uuid4())
+        logger.info(f"New user session: {st.session_state.user_id}")
+    return st.session_state.user_id
+
+def sync_user_role():
+    """Sync user role and team from organizations.json if in org"""
+    if st.session_state.get('org_id'):
+        org = get_organization(st.session_state.org_id)
+        if org:
+            user_id = get_user_id()
+            members = org.get("members", {})
+            
+            if user_id in members:
+                # Update session with latest role from JSON
+                latest_role = members[user_id]["role"]
+                if st.session_state.org_role != latest_role:
+                    st.session_state.org_role = latest_role
+                
+                # UPDATE: Sync team_id
+                latest_team_id = members[user_id].get("team_id")
+                if st.session_state.team_id != latest_team_id:
+                    st.session_state.team_id = latest_team_id
+            else:
+                # User removed from org - clear session
+                st.session_state.org_id = None
+                st.session_state.org_role = None
+                st.session_state.user_name = None
+                st.session_state.team_id = None  # ← ADD THIS
+                st.session_state.selected_team_id = None  # ← ADD THIS
+
+
+
+def get_user_collections(user_id: str) -> List[str]:
+    """Get user's collections"""
+    try:
+        user_path = f"db_collection/{user_id}"
+        if os.path.exists(user_path):
+            return [d for d in os.listdir(user_path) if os.path.isdir(os.path.join(user_path, d))]
+        return []
+    except Exception as e:
+        logger.error(f"Error getting collections: {e}")
+        return []
+    
+def display_collection_name(user_id: str, namespaced_name: str) -> str:
+    """Show clean collection names to users"""
+    from core.knowledge_base import get_display_collection_name
+    return get_display_collection_name(user_id, namespaced_name)
+
+def create_collection(target_id: str, collection_name: str, files: List):
+    """Create new collection from uploaded files - ENHANCED VERSION WITH CLOUD CLEANUP"""
+    try:
+        from core.knowledge_base import kb_manager
+        from core.knowledge_base import create_knowledge_base
+        
+        user_path = f"db_collection/{target_id}"
+        os.makedirs(user_path, exist_ok=True)
+        
+        # STEP 1: Delete ALL existing Chroma Cloud collections for this user
+        try:
+            client = kb_manager._get_chroma_client()
+            all_collections = client.list_collections()
+            user_prefix = f"{target_id}_"
+            
+            for collection in all_collections:
+                if collection.name.startswith(user_prefix):
+                    client.delete_collection(name=collection.name)
+                    logger.info(f"Deleted remote collection: {collection.name}")
+        except Exception as e:
+            logger.warning(f"Could not clean up remote collections: {e}")
+        
+        # STEP 2: Remove existing local collections 
+        for existing in os.listdir(user_path):
+            existing_path = os.path.join(user_path, existing)
+            if os.path.isdir(existing_path):
+                shutil.rmtree(existing_path)
+                logger.info(f"Removed local collection: {existing}")
+        
+        # STEP 3: Create new collection directory and save files
+        collection_path = os.path.join(user_path, collection_name)
+        os.makedirs(collection_path, exist_ok=True)
+        
+        # Save uploaded files
+        file_paths = []
+        for file in files:
+            file_path = os.path.join(collection_path, file.name)
+            with open(file_path, "wb") as f:
+                f.write(file.getvalue())
+            file_paths.append(file_path)
+        
+        logger.info(f"Saved {len(files)} files for processing")
+        
+        # STEP 4: Create vector database using your knowledge_base.py logic
+        result = create_knowledge_base(target_id, collection_name, file_paths)
+        
+        if result["success"]:
+            logger.info(f"Knowledge base created successfully: {collection_name}")
+            return True
+        else:
+            logger.error(f"Knowledge base creation failed: {result.get('error', 'Unknown error')}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Failed to create collection: {e}")
+        return False
+
+def show_create_org_form():
+    """Form to create new organization"""
+    st.header("🏢 Create Organization")
+    
+    with st.form("create_org_form"):
+        org_name = st.text_input(
+            "Organization Name",
+            placeholder="e.g., Acme Corporation"
+        )
+        
+        user_name = st.text_input(
+            "Your Name",
+            placeholder="e.g., John Smith"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("Create", use_container_width=True)
+        with col2:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+        
+        if cancel:
+            st.session_state.show_create_org = False
+            st.rerun()
+        
+        if submitted:
+            if not org_name or not user_name:
+                st.error("Please fill in all fields")
+            else:
+                user_id = get_user_id()
+                result = create_organization(org_name, user_name, user_id)
+                
+                if result["success"]:
+                    st.session_state.org_id = result["org_id"]
+                    st.session_state.org_role = result["role"]
+                    st.session_state.user_name = user_name
+                    st.session_state.show_create_org = False
                     
-                    if state_verified:
-                        logger.info("🌐 CLOUD: ✅ User-isolated state verification passed")
+                    st.success(f"✅ Organization '{org_name}' created!")
+                    st.info(f"🎟️ **Invite Code:** `{result['invite_code']}`")
+                    st.caption("Share this code with your team")
+                    
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+
+
+def show_join_org_form():
+    """Form to join existing organization"""
+    st.header("🔗 Join Organization")
+    
+    with st.form("join_org_form"):
+        user_name = st.text_input(
+            "Your Name",
+            placeholder="e.g., Sarah Johnson"
+        )
+        
+        invite_code = st.text_input(
+            "Invite Code",
+            placeholder="e.g., ACM5H2K9",
+            max_chars=8
+        ).upper()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("Join", use_container_width=True)
+        with col2:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+        
+        if cancel:
+            st.session_state.show_join_org = False
+            st.rerun()
+        
+        if submitted:
+            if not user_name or not invite_code:
+                st.error("Please fill in all fields")
+            else:
+                user_id = get_user_id()
+                result = join_organization(invite_code, user_name, user_id)
+                
+                if result["success"]:
+                    st.session_state.org_id = result["org_id"]
+                    st.session_state.org_role = result["role"]
+                    st.session_state.user_name = user_name
+                    st.session_state.show_join_org = False
+                    
+                    st.success(f"✅ Joined '{result['org_name']}'!")
+                    st.info(f"Your role: {result['role'].title()}")
+                    
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+
+
+def upload_to_organization():
+    """Upload documents to organization KB (owner/team admin)"""
+    if not st.session_state.org_id:
+        st.warning("Join an organization first")
+        return
+    
+    user_id = get_user_id()
+    
+    # Determine upload target
+    upload_target_id = None
+    upload_team_name = None
+    
+    if st.session_state.org_role in ["owner", "team_admin"]:
+        # Owner selects team to upload to
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if not teams:
+            st.warning("⚠️ Create teams first in Team Management")
+            if st.button("Go to Team Management"):
+                st.session_state['show_team_management'] = True
+                st.rerun()
+            return
+        
+        st.subheader("📤 Upload to Team")
+        team_options = {t["team_id"]: t["team_name"] for t in teams}
+        
+        selected_team = st.selectbox(
+            "Select team:",
+            list(team_options.keys()),
+            format_func=lambda x: team_options[x],
+            key="owner_upload_team_selector"
+        )
+        
+        upload_target_id = f"{st.session_state.org_id}/{selected_team}"
+        upload_team_name = team_options[selected_team]
+        
+    elif st.session_state.org_role == "team_admin":
+        # Team admin uploads to their team
+        if not st.session_state.team_id:
+            st.error("You're not assigned to a team")
+            return
+        
+        upload_target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+        
+        # Get team name
+        org = get_organization(st.session_state.org_id)
+        teams = org.get("teams", {})
+        if st.session_state.team_id in teams:
+            upload_team_name = teams[st.session_state.team_id]["team_name"]
+        else:
+            upload_team_name = "Your Team"
+        
+        st.subheader(f"📤 Upload to {upload_team_name}")
+    else:
+        st.error("❌ Only owner and team admins can upload")
+        return
+    
+    # Show target info
+    st.info(f"📁 Uploading to: **{upload_team_name}**")
+    
+    collection_name = st.text_input(
+        "Collection Name", 
+        value="team_knowledge",
+        key="org_collection_name"
+    )
+    
+    uploaded_files = st.file_uploader(
+        "Upload Documents",
+        accept_multiple_files=True,
+        type=["txt", "pdf", "docx", "doc", "md", "csv", "json"],
+        key="org_file_uploader"
+    )
+    
+    if uploaded_files and st.button("Upload to Organization", key="org_upload_btn"):
+        with st.spinner(f"Uploading to {upload_team_name}..."):
+            result = upload_local_files(
+                user_id=upload_target_id,  # ← Uses org_id/team_id format!
+                collection_name=collection_name,
+                files=uploaded_files
+            )
+            
+            if result.get("success"):
+                st.success(f"✅ Uploaded {len(uploaded_files)} files to {upload_team_name}!")
+                st.info(f"Team members of {upload_team_name} can now access these documents")
+            else:
+                st.error(f"❌ Upload failed: {result.get('error')}")
+
+def render_rag_sidebar():
+    """RAG Configuration - Fully integrated with organization features"""
+    st.sidebar.markdown("---")
+    
+    # Determine mode and title
+    if st.session_state.org_id:
+        org = get_organization(st.session_state.org_id)
+        if org:
+            st.sidebar.subheader(f"📚 RAG ({org['org_name']})")
+            st.sidebar.caption(f"Role: {st.session_state.org_role.title()}")
+        else:
+            st.sidebar.subheader("📚 RAG Configuration")
+    else:
+        st.sidebar.subheader("📚 RAG Configuration")
+    
+    # Get active collection
+    target_id = st.session_state.org_id if st.session_state.org_id else get_user_id()
+    
+    # Get collections using local file check (fast!)
+    collections = get_user_collections(target_id)
+
+
+    # Show collection status
+    if collections:
+        collection_name = collections[0]
+        clean_name = display_collection_name(target_id, collection_name)
+        mode_label = "org" if st.session_state.org_id else "personal"
+        st.sidebar.success(f"✅ Active: {clean_name} ({mode_label})")
+    else:
+        if st.session_state.org_id:
+            st.sidebar.info("No org collection loaded")
+        else:
+            st.sidebar.info("No collection loaded")
+
+    # OWNER BUTTONS (Always visible - NOT dependent on collections)
+    if st.session_state.org_id and st.session_state.org_role == "owner":
+        # CREATE TEAM - Always visible
+        if st.sidebar.button("🏗️ Create Team", key="create_team_btn"):
+            st.session_state['show_create_team_dialog'] = True
+            st.rerun()
+        
+        # MANAGE TEAMS - Only if teams exist
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            if st.sidebar.button("👥 Manage Teams", key="manage_teams"):
+                st.session_state['show_team_management'] = True
+                st.rerun()
+
+    # EDIT COLLECTION - Only if collection exists
+    if collections:
+        if st.session_state.org_id:
+            if st.session_state.org_role in ["owner", "team_admin"]:
+                if st.sidebar.button("✏️ Edit Collection", key="edit_org"):
+                    st.session_state['show_edit'] = True
+                    st.rerun()
+            else:
+                st.sidebar.button("🔒 Edit (Owner/Team Admin Only)", disabled=True, key="edit_disabled")
+        else:
+            # Personal mode edit
+            if st.sidebar.button("✏️ Edit Collection", key="edit_personal"):
+                st.session_state['show_edit'] = True
+                st.rerun()
+
+    
+    # Show org info if in organization
+    if st.session_state.org_id:
+        org = get_organization(st.session_state.org_id)
+        if org:
+            # Compact org details
+            col1, col2 = st.sidebar.columns([2, 1])
+            with col1:
+                if st.session_state.org_role == "owner":
+                    with st.sidebar.expander("📋 Invite Code"):
+                        st.code(org['invite_code'])
+                        st.caption("Share with team")
+            with col2:
+                member_count = org_manager.get_member_count(st.session_state.org_id)
+                st.sidebar.write(f"👥 {member_count}")    
+            # Show collection info
+            if st.session_state.org_id:
+                # Organization mode
+                org = get_organization(st.session_state.org_id)
+                if org:
+                    org_name = org["org_name"]
+                    st.sidebar.markdown(f"**🏢 {org_name}**")
+                    st.sidebar.markdown(f"*Role: {st.session_state.org_role.title()}*")
+                
+                # ADD THIS: Team selector for owner
+                if st.session_state.org_role == "owner":
+                    org = get_organization(st.session_state.org_id)
+                    teams = org_manager.get_teams(st.session_state.org_id)
+                    
+                    if teams:
+                        st.sidebar.markdown("---")
+                        st.sidebar.markdown("**Query Team:**")
+                        
+                        team_options = {team["team_id"]: team["team_name"] for team in teams}
+                        team_ids = list(team_options.keys())
+                        team_names = list(team_options.values())
+                        
+                        # Default to first team if not selected
+                        if not st.session_state.selected_team_id and team_ids:
+                            st.session_state.selected_team_id = team_ids[0]
+                        
+                        selected_index = team_ids.index(st.session_state.selected_team_id) if st.session_state.selected_team_id in team_ids else 0
+                        
+                        selected_team = st.sidebar.selectbox(
+                            "Select team to query:",
+                            team_names,
+                            index=selected_index,
+                            key="team_selector"
+                        )
+                        
+                        # Update selected team
+                        st.session_state.selected_team_id = team_ids[team_names.index(selected_team)]
+                        
+                        st.sidebar.info(f"✅ Querying: {selected_team}")
+                    else:
+                        st.sidebar.warning("No teams created yet")
+                elif st.session_state.team_id:
+                    # Team member/admin - show their team
+                    org = get_organization(st.session_state.org_id)
+                    teams = org.get("teams", {})
+                    if st.session_state.team_id in teams:
+                        team_name = teams[st.session_state.team_id]["team_name"]
+                        st.sidebar.info(f"📁 Team: {team_name}")
+                else:
+                    # Unassigned member
+                    st.sidebar.warning("⏳ Not assigned to a team")
+                    
+            # Leave organization button (different for admin vs viewer)
+            if st.session_state.org_role == "owner":
+                if st.sidebar.button("← Leave Organization", key="leave_org_admin"):
+                    st.session_state['show_transfer_admin'] = True
+                    st.rerun()
+            else:
+                # Viewer can leave directly
+                if st.sidebar.button("← Leave Organization", key="leave_org_viewer"):
+                    org_manager.remove_member(st.session_state.org_id, get_user_id())
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.success("Left organization")
+                    time.sleep(1)
+                    st.rerun()
+
+            
+            st.sidebar.markdown("---")
+    
+    # THREE MAIN BUTTONS (context-aware)
+    # Button 1: Create Collection
+    if st.session_state.org_id:
+        # In organization mode
+        if st.session_state.org_role in ["owner", "team_admin"]:
+            button_label = "📁 Create Collection (Org)"
+            button_disabled = False
+            button_key = "create_org_collection"
+        else:
+            button_label = "🔒 Create Collection (Owner/Team Admin Only)"
+            button_disabled = True
+            button_key = "create_disabled_viewer"
+
+    else:
+        # Personal mode
+        button_label = "📁 Create Collection"
+        button_disabled = False
+        button_key = "create_personal_collection"
+    
+    if st.sidebar.button(button_label, disabled=button_disabled, key=button_key, use_container_width=True):
+        st.session_state['show_upload'] = True
+        st.rerun()
+    
+    # Button 2 & 3: Create/Join Organization (only if NOT in org)
+    if not st.session_state.org_id:
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            if st.button("🏢 Create Org", key="create_org_sidebar", use_container_width=True):
+                st.session_state.show_create_org = True
+                st.rerun()
+        
+        with col2:
+            if st.button("🔗 Join Org", key="join_org_sidebar", use_container_width=True):
+                st.session_state.show_join_org = True
+                st.rerun()
+
+# Import core system
+try:
+    from core import (
+        Config, LLMClient, OptimizedAgent, 
+        ToolManager, BrainHeartException
+    )
+    SYSTEM_AVAILABLE = True
+except ImportError as e:
+    st.error(f"Core system import failed: {e}")
+    st.markdown("""
+    **Fix Dependencies:**
+    ```
+    python fix_dependencies.py
+    # OR manually:
+    pip install aiohttp python-dotenv streamlit requests pandas numpy
+    ```
+    """)
+    SYSTEM_AVAILABLE = False
+
+
+if not SYSTEM_AVAILABLE:
+    st.stop()
+
+
+# Page configuration
+st.set_page_config(
+    page_title="Brain-Heart Deep Research System",
+    page_icon="🧠❤️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+@st.cache_resource
+def initialize_config():
+    """Initialize configuration"""
+    try:
+        config = Config()
+        return {"config": config, "status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+async def create_agents_async(config, brain_agent_config, heart_agent_config, web_model_config, use_premium_search=False):
+    """Create Optimized Agent with selected models"""
+    try:
+        # Create LLM clients (use same config for both brain and heart)
+        brain_llm = LLMClient(brain_agent_config)
+        heart_llm = LLMClient(heart_agent_config)
+        
+        # Create tool manager
+        tool_manager = ToolManager(config, brain_llm, web_model_config, use_premium_search)
+        
+        # Create optimized agent (uses same LLM for both brain and heart functions)
+        optimized_agent = OptimizedAgent(brain_llm, heart_llm, tool_manager)
+        
+        return {
+            "optimized_agent": optimized_agent,
+            "tool_manager": tool_manager,
+            "status": "success"
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+
+def display_model_selector(config, agent_name: str, key_prefix: str):
+    """Display model selection interface with unique keys"""
+    
+    providers = config.get_available_providers()
+    
+    col1, col2 = st.columns([2, 2])
+    
+    with col1:
+        provider = st.selectbox(
+            f"{agent_name} Provider:",
+            providers,
+            key=f"{key_prefix}_provider"
+        )
+    
+    with col2:
+        models = config.get_available_models(provider)
+        model = st.selectbox(
+            f"{agent_name} Model:",
+            models,
+            key=f"{key_prefix}_model"
+        )
+    
+    return config.create_llm_config(provider, model)
+
+
+def display_web_model_selector(config, agent_name: str):
+    """Display web model selection interface"""
+    
+    col1 = st.columns([2])[0]
+    
+    with col1:
+        models = config.get_available_web_models()
+        model = st.selectbox(
+            f"{agent_name} Model:",
+            models,
+            key=f"{agent_name}_model"
+        )
+    
+    return model
+
+
+async def process_query_real(query: str, optimized_agent, style: str, user_id: str = None, chat_history: List = None) -> Dict[str, Any]:
+    """Process query through Optimized Agent"""
+    
+    try:
+        start_time = time.time()
+        
+        # Single agent processing
+        st.info("🚀 Optimized Agent processing query...")
+        result = await mog_query(user_id, chat_history, query)
+        
+        total_time = time.time() - start_time
+        
+        if result.get("success"):
+            result["total_time"] = total_time
+            return result
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "Processing failed")
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"System processing failed: {str(e)}"
+        }
+
+
+def display_real_results(result: Dict[str, Any], query: str):
+    """Display results from Optimized Agent"""
+    
+    if not result.get("success"):
+        st.error(f"❌ Processing failed: {result.get('error', 'Unknown error')}")
+        with st.expander("🔍 Debug Information"):
+            st.json(result)
+        return
+    
+    # Main response from Optimized Agent
+    st.markdown("## 💎 Final Response")
+    response = result.get("response", "No response generated")
+    if response:
+        st.markdown(response)
+    else:
+        st.warning("No response generated by Optimized Agent")
+    
+    # Performance metrics
+    processing_time = result.get("processing_time", {})
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("⚡ Analysis Time", f"{processing_time.get('analysis', 0):.2f}s")
+    with col2:
+        st.metric("⏱️ Total Time", f"{processing_time.get('total', 0):.2f}s")
+    with col3:
+        tools_used = result.get("tools_used", [])
+        st.metric("🛠️ Tools Used", len(tools_used))
+    
+    # Detailed analysis tabs
+    tab1, tab2, tab3 = st.tabs(["🚀 Analysis", "🛠️ Tool Results", "🔍 Raw Data"])
+    
+    with tab1:
+        st.markdown("### 🚀 Optimized Agent Analysis")
+        
+        analysis = result.get("analysis", {})
+        if analysis:
+            st.markdown("**Semantic Intent:**")
+            st.markdown(f"- {analysis.get('semantic_intent', 'Unknown')}")
+            
+            business_opp = analysis.get('business_opportunity', {})
+            if business_opp.get('detected'):
+                st.markdown("**Business Opportunity Detected:**")
+                st.markdown(f"- Score: {business_opp.get('composite_confidence', 0)}/100")
+                st.markdown(f"- Pain Points: {', '.join(business_opp.get('pain_points', []))}")
+            
+            if tools_used:
+                st.markdown("**Tools Selected:**")
+                for tool in tools_used:
+                    st.markdown(f"- {tool}")
+    
+    with tab2:
+        st.markdown("### 🛠️ Tool Execution Results")
+        
+        tool_results = result.get("tool_results", {})
+        if tool_results:
+            for tool_name, tool_result in tool_results.items():
+                with st.expander(f"🔧 {tool_name.title()} Results"):
+                    if isinstance(tool_result, dict) and 'error' not in tool_result:
+                        # Handle different tool result formats
+                        if 'results' in tool_result and isinstance(tool_result['results'], list):
+                            # Web search results
+                            st.success(f"Found {len(tool_result['results'])} results")
+                            for i, search_result in enumerate(tool_result['results'][:3]):
+                                st.markdown(f"**{i+1}. {search_result.get('title', 'No title')}**")
+                                st.markdown(f"Link: {search_result.get('link', 'No link')}")
+                                st.markdown(f"   {search_result.get('snippet', 'No snippet')}")
+                        elif 'retrieved' in tool_result:
+                            # RAG results
+                            st.success("Knowledge base retrieved")
+                            st.markdown(tool_result['retrieved'][:300] + "..." if len(tool_result['retrieved']) > 300 else tool_result['retrieved'])
+                        else:
+                            # Generic result
+                            st.json(tool_result)
+                    else:
+                        st.error(f"Tool error: {tool_result.get('error', 'Unknown error')}")
+        else:
+            st.info("No tools were used for this query")
+    
+    with tab3:
+        st.markdown("### 🔍 Complete Raw Data")
+        st.json(result)
+
+def show_team_management_panel():
+    """Team management panel for organization owner"""
+    st.markdown("# 👥 Team Management")
+    
+    org = get_organization(st.session_state.org_id)
+    if not org:
+        st.error("Organization not found")
+        return
+    
+    user_id = get_user_id()
+    
+    # Check if owner
+    if org["owner_id"] != user_id:
+        st.error("Only owner can manage teams")
+        return
+    
+    # Close button
+    if st.button("← Back to Chat"):
+        st.session_state['show_team_management'] = False
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Tabs for different sections
+    tab1, tab2, tab3 = st.tabs(["📋 Teams", "👥 Unassigned Members", "🗑️ Delete Team"])
+    
+    # TAB 1: Create & Manage Teams
+    with tab1:
+        st.markdown("### Create New Team")
+        with st.form("create_team_form"):
+            team_name = st.text_input("Team Name", placeholder="DevOps Team")
+            submit = st.form_submit_button("Create Team")
+            
+            if submit and team_name:
+                result = org_manager.create_team(
+                    st.session_state.org_id,
+                    team_name,
+                    user_id
+                )
+                if result["success"]:
+                    st.success(f"✅ Team '{team_name}' created!")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
+        
+        st.markdown("---")
+        st.markdown("### Existing Teams")
+        
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            for team in teams:
+                with st.expander(f"📁 {team['team_name']}", expanded=False):
+                    team_members = org_manager.get_team_members(
+                        st.session_state.org_id,
+                        team["team_id"]
+                    )
+                    
+                    # Team admin info
+                    team_admin_id = team.get("team_admin_id")
+                    if team_admin_id:
+                        admin_name = next(
+                            (m["name"] for m in team_members if m["user_id"] == team_admin_id),
+                            "Unknown"
+                        )
+                        st.info(f"👑 Admin: {admin_name}")
+                    else:
+                        st.warning("⚠️ No team admin assigned")
+                    
+                    st.markdown(f"**Members ({len(team_members)}):**")
+                    
+                    if team_members:
+                        for member in team_members:
+                            col1, col2, col3 = st.columns([3, 2, 1])
+                            with col1:
+                                role_icon = "👑" if member["role"] == "team_admin" else "👤"
+                                st.write(f"{role_icon} {member['name']}")
+                            with col2:
+                                st.caption(member['role'].replace('_', ' ').title())
+                            with col3:
+                                if st.button("Remove", key=f"remove_{team['team_id']}_{member['user_id']}"):
+                                    result = org_manager.remove_member_from_team(
+                                        st.session_state.org_id,
+                                        team["team_id"],
+                                        member["user_id"],
+                                        user_id
+                                    )
+                                    if result["success"]:
+                                        st.success("Member removed")
+                                        st.rerun()
+                                    else:
+                                        st.error(result["error"])
+                    else:
+                        st.caption("No members yet")
+                    
+                    # Assign team admin
+                    st.markdown("---")
+                    st.markdown("**Assign Team Admin:**")
+                    if team_members:
+                        member_options = {m["user_id"]: m["name"] for m in team_members}
+                        selected_admin = st.selectbox(
+                            "Choose admin:",
+                            list(member_options.keys()),
+                            format_func=lambda x: member_options[x],
+                            key=f"admin_select_{team['team_id']}"
+                        )
+                        if st.button("Set as Admin", key=f"set_admin_{team['team_id']}"):
+                            result = org_manager.assign_team_admin(
+                                st.session_state.org_id,
+                                team["team_id"],
+                                selected_admin,
+                                user_id
+                            )
+                            if result["success"]:
+                                st.success("Team admin assigned!")
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+        else:
+            st.info("No teams created yet")
+    
+    # TAB 2: Unassigned Members
+    with tab2:
+        st.markdown("### Unassigned Members")
+        unassigned = org_manager.get_unassigned_members(st.session_state.org_id)
+        teams = org_manager.get_teams(st.session_state.org_id)
+        
+        if unassigned and teams:
+            for member in unassigned:
+                with st.container():
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        st.write(f"👤 {member['name']}")
+                    with col2:
+                        team_options = {t["team_id"]: t["team_name"] for t in teams}
+                        selected_team = st.selectbox(
+                            "Assign to:",
+                            list(team_options.keys()),
+                            format_func=lambda x: team_options[x],
+                            key=f"assign_{member['user_id']}"
+                        )
+                        if st.button("Assign", key=f"assign_btn_{member['user_id']}"):
+                            result = org_manager.add_member_to_team(
+                                st.session_state.org_id,
+                                selected_team,
+                                member["user_id"],
+                                user_id
+                            )
+                            if result["success"]:
+                                st.success("Member assigned!")
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+                    st.markdown("---")
+        elif not teams:
+            st.warning("Create teams first")
+        else:
+            st.info("All members are assigned to teams")
+    
+    # TAB 3: Delete Team
+    with tab3:
+        st.markdown("### Delete Team")
+        st.warning("⚠️ Teams can only be deleted if they have no members")
+        
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            team_options = {t["team_id"]: t["team_name"] for t in teams}
+            selected_team = st.selectbox(
+                "Select team to delete:",
+                list(team_options.keys()),
+                format_func=lambda x: team_options[x],
+                key="delete_team_select"
+            )
+            
+            # Show team member count
+            team_members = org_manager.get_team_members(
+                st.session_state.org_id,
+                selected_team
+            )
+            st.info(f"Members in team: {len(team_members)}")
+            
+            if st.button("🗑️ Delete Team", type="primary"):
+                result = org_manager.delete_team(
+                    st.session_state.org_id,
+                    selected_team,
+                    user_id
+                )
+                if result["success"]:
+                    st.success("Team deleted!")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
+        else:
+            st.info("No teams to delete")
+
+def main():
+    """Main Streamlit application - REAL Brain-Heart system"""
+    
+    if 'app_initialized' not in st.session_state:
+        # start_background_cleanup()
+        st.session_state.app_initialized = True
+    
+    # Initialize chat history
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+        logger.info(f"Initialized chat history for user: {get_user_id()}")
+    
+    # Header
+    st.markdown("# 🧠❤️ Brain-Heart Deep Research System")
+    st.markdown("### Pure LLM Architecture - Agents Think, Tools Execute")
+    
+    # Sync user role with JSON file
+    sync_user_role()
+    
+    # Show org forms if active
+    if st.session_state.get("show_create_org"):
+        show_create_org_form()
+        st.stop()
+
+    if st.session_state.get("show_join_org"):
+        show_join_org_form()
+        st.stop()
+    # CREATE TEAM DIALOG
+    if st.session_state.get("show_create_team_dialog"):
+        st.markdown("## 🏗️ Create New Team")
+        
+        with st.form("quick_create_team_form"):
+            team_name = st.text_input("Team Name", placeholder="e.g., DevOps Team")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                submit = st.form_submit_button("✅ Create Team", use_container_width=True)
+            with col2:
+                cancel = st.form_submit_button("❌ Cancel", use_container_width=True)
+            
+            if cancel:
+                st.session_state['show_create_team_dialog'] = False
+                st.rerun()
+            
+            if submit and team_name:
+                result = org_manager.create_team(
+                    st.session_state.org_id,
+                    team_name,
+                    get_user_id()
+                )
+                
+                if result["success"]:
+                    st.success(f"✅ Team '{team_name}' created successfully!")
+                    st.session_state['show_create_team_dialog'] = False
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+        
+        st.stop()
+
+    # Show team management panel
+    if st.session_state.get("show_team_management"):
+        show_team_management_panel()
+        st.stop()
+        
+    # TRANSFER ADMIN ROLE DIALOG
+    if st.session_state.get('show_transfer_admin'):
+        st.markdown("---")
+        
+        org = get_organization(st.session_state.org_id)
+        members = org.get("members", {})
+        
+        # Get other members (exclude current admin)
+        current_user_id = get_user_id()
+        other_members = {uid: info for uid, info in members.items() if uid != current_user_id}
+        
+        if not other_members:
+            # Admin is alone - allow delete
+            st.warning("⚠️ You are the only member in this organization")
+            st.markdown("**You can:**")
+            st.markdown("- Delete the organization (will remove all data)")
+            st.markdown("- Cancel and stay as admin")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Delete Organization", key="delete_org_solo"):
+                    org_id = st.session_state.org_id
+                    
+                    # Delete org files
+                    import shutil
+                    org_path = f"db_collection/{org_id}"
+                    if os.path.exists(org_path):
+                        shutil.rmtree(org_path)
+                    
+                    # Delete from JSON
+                    org_manager.delete_organization(org_id)
+                    
+                    # Clear session
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.session_state['show_transfer_admin'] = False
+                    
+                    st.success("✅ Organization deleted")
+                    time.sleep(2)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel", key="cancel_delete_solo"):
+                    st.session_state['show_transfer_admin'] = False
+                    st.rerun()
+        
+        else:
+            # Has members - must transfer admin
+            st.info(f"👥 Transfer admin role to continue")
+            st.markdown(f"**Organization:** {org['org_name']}")
+            st.markdown(f"**Members:** {len(other_members)}")
+            
+            # Create member list for selection
+            member_options = []
+            member_ids = []
+            for uid, info in other_members.items():
+                member_options.append(f"{info['name']} (Viewer)")
+                member_ids.append(uid)
+            
+            selected = st.selectbox("Select new admin:", member_options, key="select_new_admin")
+            selected_index = member_options.index(selected)
+            new_admin_id = member_ids[selected_index]
+            
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("✅ Transfer & Leave", key="confirm_transfer"):
+                    # Transfer admin role
+                    org_manager.transfer_admin(
+                        st.session_state.org_id, 
+                        current_user_id, 
+                        new_admin_id
+                    )
+                    
+                    # Clear session
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.session_state['show_transfer_admin'] = False
+                    
+                    new_admin_name = selected.split(' (')[0]
+                    st.success(f"✅ Admin transferred to {new_admin_name}")
+                    st.info("You have left the organization")
+                    time.sleep(2)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel", key="cancel_transfer"):
+                    st.session_state['show_transfer_admin'] = False
+                    st.rerun()
+        
+        st.stop()
+
+    # Initialize configuration
+    config_result = initialize_config()
+    
+    if config_result["status"] == "error":
+        st.error(f"❌ Configuration failed: {config_result['error']}")
+        st.markdown("""
+        **Setup Required:**
+        1. Run: `python fix_dependencies.py`
+        2. Copy `.env.example` to `.env`
+        3. Add at least one LLM provider API key
+        4. Restart the application
+        """)
+        st.stop()
+    
+    config = config_result["config"]
+    
+    # Sidebar configuration
+    with st.sidebar:
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state['chat_history'] = []  
+            st.success("Chat cleared!")
+            st.rerun()
+                        
+        st.markdown("## 🎛️ Model Configuration")
+        
+        available_providers = config.get_available_providers()
+        st.success(f"✅ Available: {', '.join(available_providers)}")
+        
+        # 🆕 Brain Agent Configuration
+        st.markdown("### 🧠 Brain Agent")
+        st.caption("Analysis, planning, and orchestration")
+        brain_model_config = display_model_selector(config, "Brain", "brain")
+        
+        st.markdown("---")
+        
+        # 🆕 Heart Agent Configuration
+        st.markdown("### ❤️ Heart Agent")
+        st.caption("Response synthesis and communication")
+        heart_model_config = display_model_selector(config, "Heart", "heart")
+
+        st.markdown("---")
+
+        # Web Agent Configuration  
+        st.markdown("### 🌐 Web Search Agent")
+        st.caption("Handles web search operations")
+        # Premium search toggle
+        use_premium_search = st.checkbox("🚀 Enable Premium Search (Perplexity)", value=False)
+        
+        # Show model selector only if premium enabled
+        if use_premium_search:
+            web_model_config = display_web_model_selector(config, "Web")
+        else:
+            web_model_config = None  # Will use Serper/ValueSerp
+        
+        st.markdown("---")
+        st.markdown("### 🧪 Debug Cleanup")
+        if st.button("🧪 Manual Cleanup Test"):
+            logger.info("🧪 MANUAL TEST: Starting cleanup...")
+            cleanup_expired_sessions()
+            logger.info("🧪 MANUAL TEST: Cleanup completed")
+            st.success("Check terminal logs!")
+
+        if st.button("📂 Show Sessions"):
+            if os.path.exists("sessions"):
+                for user_dir in os.listdir("sessions"):
+                    st.write(f"👤 {user_dir}")
+                    user_path = os.path.join("sessions", user_dir)
+                    if os.path.isdir(user_path):
+                        for f in os.listdir(user_path):
+                            st.write(f"  📄 {f}")
+                # Communication style
+        st.markdown("### 💬 Response Style")
+        style = st.selectbox(
+            "Heart Agent Communication:",
+            ["professional", "executive", "technical", "creative"],
+            help="How the Heart Agent presents final response"
+        )
+        
+        # RAG Configuration - RIGHT BELOW RESPONSE STYLE - ONLY ADDITION
+        render_rag_sidebar()
+        
+        st.markdown("---")  # ONLY ADDITION
+        
+        # Tool status
+        st.markdown("### 🛠️ Available Tools")
+        tool_configs = config.get_tool_configs(web_model=web_model_config, use_premium_search=use_premium_search)
+        for tool_name, tool_config in tool_configs.items():
+            status = "✅" if tool_config.get("enabled", False) else "❌"
+            st.markdown(f"{status} {tool_name}")
+            if tool_name == "web_search" and tool_config.get("enabled"):
+                st.caption(f"   Model: {web_model_config}")
+
+    # FILE UPLOAD INTERFACE - ONLY ADDITION  
+    if st.session_state.get('show_upload', False):
+        st.markdown("---")
+        # Determine mode and target
+        if st.session_state.org_id:
+            target_id = st.session_state.org_id
+            mode = "Organization"
+            
+            # Permission check
+            if st.session_state.org_role not in ["owner", "team_admin"]:
+                st.error("❌ Only owner and team admins can edit organization collections")
+                if st.button("Close", key="close_upload_error"):
+                    st.session_state['show_upload'] = False
+                    st.rerun()
+                st.stop()
+            
+            st.markdown(f"## 📤 Create {mode} Collection")
+            org = get_organization(st.session_state.org_id)
+            st.info(f"Creating for: **{org['org_name']}**")
+        else:
+            target_id = get_user_id()
+            mode = "Personal"
+            st.markdown("## 📤 Upload Documents for RAG")
+        
+        collection_name = st.text_input("Collection Name:", value="")
+        
+        # File source tabs
+        tab1, tab2 = st.tabs(["💻 Local Files", "📁 Google Drive"])
+        
+        file_paths = None
+        
+        with tab1:
+            uploaded_files = st.file_uploader(
+                "Upload Files:",
+                type=[
+                    'txt', 'md', 'rtf', 'pdf', 'doc', 'docx', 'docm', 'dot', 'dotx', 'dotm', 'odt',
+                    'csv', 'tsv', 'json', 'xlsx', 'xls', 'xlsm', 'xlsb', 'xltx', 'xltm', 'ods',
+                    'ppt', 'pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm', 'odp',
+                    'mdb', 'accdb', 'html', 'htm', 'xml', 'msg', 'eml', 'epub'
+                ],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                file_paths = "local_files"  # Flag for local files
+        
+        with tab2:
+            # Multi-account Google Drive picker with NO premature download
+            selected_files = render_multi_account_drive_picker(get_user_id(), download_files=False)
+            
+            if selected_files and len(selected_files) > 0:
+                file_paths = selected_files  # File metadata, not actual files
+                
+                # Show selected files summary (NO download yet)
+                st.success(f"✅ Selected {len(selected_files)} files from Google Drive")
+                
+                # Show file details
+                for file_info in selected_files:
+                    st.write(f"📄 {file_info['name']} ({file_info.get('account_alias', 'Unknown account')})")
+                
+                # Group files by account using metadata
+                account_summary = {}
+                for file_info in selected_files:
+                    account_id = file_info.get('account_id', 'unknown')
+                    account_summary[account_id] = account_summary.get(account_id, 0) + 1
+                
+                if len(account_summary) > 1:
+                    st.info(f"📊 Files from {len(account_summary)} accounts: " + 
+                        ", ".join([f"{acc}: {count}" for acc, count in account_summary.items()]))
+            else:
+                file_paths = None
+
+        
+        # Create collection button
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Create Collection", key="upload_local_files"):
+                if not collection_name.strip():
+                    st.error("❌ Please enter collection name")
+                else:
+                    # ✅ ROBUST: Check files based on what's actually available
+                    has_local_files = uploaded_files and len(uploaded_files) > 0
+                    has_drive_files = file_paths and file_paths != "local_files" and len(file_paths) > 0
+                    
+                    if not has_local_files and not has_drive_files:
+                        st.error("❌ Please select files from either Local Files or Google Drive tab")
+                    elif has_local_files and has_drive_files:
+                        st.error("❌ Please select files from only ONE tab (Local OR Google Drive)")
+                    else:
+                        
+                        start_time = time.time()
+                        
+                        with st.spinner("🔄 Creating knowledge base..."):
+                            # Handle local vs Drive files
+                            if has_local_files:
+                                # Local files - existing logic
+                                st.info("📁 Processing local files...")
+                                res = upload_local_files(target_id, collection_name, uploaded_files)
+                                if res:
+                                    elapsed = time.time() - start_time
+                                    st.success(f"✅ Collection created in {elapsed:.1f}s!")
+                                    st.success("✅ Collection created from local files!")
+                                    st.session_state.show_upload = False
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to create collection")
+                            
+                            elif has_drive_files:
+                                # Google Drive files - DOWNLOAD ONLY WHEN CREATING
+                                st.info("📥 Processing Google Drive files...")
+                                downloaded_files = []
+                                success = False
+                                
+                                try:
+                                    # STEP 1: Download selected files NOW
+                                    st.info("📥 Downloading selected files...")
+                                    from core.google_drive_integration import MultiAccountGoogleDriveManager
+                                    drive_manager = MultiAccountGoogleDriveManager(get_user_id())
+                                    
+                                    downloaded_files = drive_manager.download_files_with_conflict_resolution(file_paths)
+                                    
+                                    if not downloaded_files:
+                                        st.error("❌ Failed to download files")
+                                    else:
+                                        st.success(f"✅ Downloaded {len(downloaded_files)} files")
+                                        
+                                        # STEP 2: Create knowledge base
+                                        st.info("🔄 Creating knowledge base...")
+                                        from core.knowledge_base import create_knowledge_base
+                                        
+                                        # Detect if multi-account
+                                        has_multiple_accounts = len(set(f.get('account_id') for f in file_paths)) > 1
+                                        
+                                        if has_multiple_accounts:
+                                            result = create_knowledge_base(
+                                                get_user_id(), 
+                                                collection_name, 
+                                                downloaded_files, 
+                                                account_info="multi_account"
+                                            )
+                                        else:
+                                            result = create_knowledge_base(target_id, collection_name, downloaded_files)
+                                        
+                                        if result["success"]:
+                                            elapsed = time.time() - start_time 
+                                            st.success(f"✅ Collection created in {elapsed:.1f}s!")
+                                            st.success("✅ Collection created from Google Drive!")
+                                            success = True
+                                        else:
+                                            st.error(f"❌ Failed to create collection: {result.get('error')}")
+                                
+                                except Exception as e:
+                                    st.error(f"❌ Error during collection creation: {e}")
+                                    logger.error(f"Collection creation error: {e}")
+                                
+                                finally:
+                                    # STEP 3: ALWAYS CLEANUP
+                                    st.info("🧹 Cleaning up...")
+                                    try:
+                                        # Clean up downloaded files
+                                        for file_path in downloaded_files:
+                                            if os.path.exists(file_path):
+                                                os.remove(file_path)
+                                        
+                                        # Revoke Google sessions for security
+                                        cleanup_multi_account_session(get_user_id(), keep_connection=True)
+                                        
+                                    except Exception as cleanup_error:
+                                        logger.error(f"Cleanup error: {cleanup_error}")
+                                    
+                                    # If successful, close upload UI
+                                    if success:
+                                        st.session_state.show_upload = False
+                                        st.rerun()
+
+        with col2:
+            if st.button("❌ Cancel", key="upload_cancel"):
+                # AUTOMATIC REVOKE FOR SECURITY (Fixed)
+                from core.google_drive_integration import MultiAccountGoogleDriveManager
+                drive_manager = MultiAccountGoogleDriveManager(get_user_id())
+                
+                # Always revoke for security when cancelling
+                with st.spinner("🔒 Cleaning up and revoking access..."):
+                    revoked = drive_manager.security_disconnect_all()
+                    if revoked > 0:
+                        st.success(f"✅ Revoked {revoked} Google accounts for security")
+                    else:
+                        # Fallback cleanup if no accounts to revoke
+                        cleanup_multi_account_session(get_user_id(), keep_connection=False)
+                
+                st.session_state.show_upload = False
+                st.rerun()
+    # EDIT COLLECTION INTERFACE
+    if st.session_state.get('show_edit', False):
+        st.markdown("---")
+        # Determine target (org or personal)
+        if st.session_state.org_id:
+            target_id = st.session_state.org_id
+            mode = "Organization"
+            
+            # Permission check
+            if st.session_state.org_role not in ["owner", "team_admin"]:
+                st.error("❌ Only owner and team admins can upload to organization")
+                if st.button("Close", key="close_edit_error"):
+                    st.session_state['show_edit'] = False
+                    st.rerun()
+                st.stop()
+            
+            st.markdown(f"## ✏️ Edit {mode} Collection")
+            org = get_organization(st.session_state.org_id)
+            st.info(f"Editing: **{org['org_name']}** collection")
+        else:
+            target_id = get_user_id()
+            mode = "Personal"
+            st.markdown("## ✏️ Edit Collection")
+        
+        collections = get_user_collections(target_id)
+        
+        if collections:
+            collection_name = collections[0]
+            
+            # Get metadata
+            try:
+                metadata_path = f"db_collection/{target_id}/{collection_name}/knowledge_base_metadata.json"
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                file_names = metadata.get('file_names', [])
+                
+                if file_names:
+                    st.markdown(f"### 📄 Current Files ({len(file_names)})")
+                    
+                    # Display files with delete buttons
+                    for filename in file_names:
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.write(f"📄 {filename}")
+                        with col2:
+                            if st.button("🗑️", key=f"delete_{filename}"):
+                                with st.spinner(f"Deleting {filename}..."):
+                                    from core.knowledge_base import delete_file
+                                    result = delete_file(target_id, collection_name, filename)
+                                    
+                                    if result["success"]:
+                                        st.success(f"✅ Deleted {filename}")
+                                        st.rerun()
+                                    else:
+                                        st.error(f"❌ Failed: {result.get('error')}")
+                else:
+                    st.warning("No files in collection")
+                
+            except Exception as e:
+                st.error(f"Error loading files: {e}")
+            
+            st.markdown("---")
+            st.markdown("### ➕ Add New Files")
+            
+            # Add files uploader
+            new_files = st.file_uploader(
+                "Upload files to add:",
+                type=[
+                    'txt', 'md', 'rtf', 'pdf', 'doc', 'docx', 'docm', 'dot', 'dotx', 'dotm', 'odt',
+                    'csv', 'tsv', 'json', 'xlsx', 'xls', 'xlsm', 'xlsb', 'xltx', 'xltm', 'ods',
+                    'ppt', 'pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm', 'odp',
+                    'mdb', 'accdb', 'html', 'htm', 'xml', 'msg', 'eml', 'epub'
+                ],
+                accept_multiple_files=True,
+                key="edit_file_uploader"
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("➕ Add Files") and new_files:
+                    with st.spinner(f"Adding {len(new_files)} files..."):
+                        # Save uploaded files temporarily
+                        temp_paths = []
+                        for file in new_files:
+                            temp_path = file.name
+                            with open(temp_path, "wb") as f:
+                                f.write(file.getvalue())
+                            temp_paths.append(temp_path)
                         
                         try:
-                            # Exchange code for credentials
-                            logger.info("🌐 CLOUD: Exchanging code for credentials...")
-                            flow.fetch_token(code=authorization_code)
-                            creds = flow.credentials
-                            logger.info("🌐 CLOUD: Successfully obtained credentials")
+                            from core.knowledge_base import add_files
+                            result = add_files(target_id, collection_name, temp_paths)
                             
-                            # Get user email from ID token
-                            try:
-                                import jwt
-                                token_info = jwt.decode(creds.id_token, options={"verify_signature": False})
-                                account_email = token_info.get('email', 'unknown@gmail.com')
-                                logger.info(f"🌐 CLOUD: Extracted email: {account_email}")
-                            except Exception as e:
-                                logger.warning(f"🌐 CLOUD: Email extraction failed: {e}")
-                                account_email = 'unknown@gmail.com'
-                            
-                            # Create session
-                            session_mgr = SessionTokenManager(self.user_id, account_id)
-                            session_id = session_mgr.create_session(creds, account_email, account_alias)
-                            
-                            if session_id:
-                                self.account_manager.add_account(account_id, account_email, account_alias)
-                                logger.info(f"🌐 CLOUD: Successfully authenticated: {account_email}")
-                                
-                                # Clear URL params
-                                st.query_params.clear()
-                                
-                                return account_id
+                            if result["success"]:
+                                st.success(f"✅ Added {len(new_files)} files!")
+                                st.rerun()
                             else:
-                                logger.error("🌐 CLOUD: Session creation failed")
-                                return None
-                                
-                        except Exception as e:
-                            logger.error(f"🌐 CLOUD: Token exchange failed: {e}", exc_info=True)
-                            st.error(f"❌ Authentication failed: {e}")
-                            return None
-                    
-                    else:
-                        logger.error("🌐 CLOUD: ❌ User-isolated state verification failed")
-                        st.error("❌ OAuth state verification failed. Please try again.")
-                        return None
+                                st.error(f"❌ Failed: {result.get('error')}")
                         
-                except Exception as e:
-                    logger.error(f"🌐 CLOUD: State verification error: {e}", exc_info=True)
-                    st.error("❌ Authentication state verification failed")
-                    return None
+                        finally:
+                            # Cleanup temp files
+                            for temp_path in temp_paths:
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
             
-            else:
-                # Generate authorization URL
-                logger.info("🌐 CLOUD: Generating authorization URL...")
+            with col2:
+                if st.button("✅ Done"):
+                    st.session_state.show_edit = False
+                    st.rerun()
+        
+        else:
+            st.error("No collection found")
+            if st.button("❌ Close"):
+                st.session_state.show_edit = False
+                st.rerun()
                 
-                try:
-                    auth_url, state = flow.authorization_url(
-                        prompt='consent',
-                        access_type='offline',
-                        include_granted_scopes='true'
-                    )
-                    
-                    # ✅ CORRECTED: Store state server-side for cross-tab support
-                    state_manager = UserIsolatedOAuthStateManager(self.user_id)
-                    state_id = state_manager.create_state(state)
-                    
-                    logger.info(f"🌐 CLOUD: ✅ Generated user-isolated auth URL")
-                    logger.info(f"🌐 CLOUD: State stored with ID: {state_id}")
-                    
-                    # Show authentication UI
-                    st.markdown("### 🔐 Google Drive Authentication Required")
-                    st.markdown("Click the link below to authenticate with Google Drive:")
-                    
-                    # ✅ CORRECTED: Use original auth_url (no &sid=)
-                    st.markdown(f"""
-                    [🚀 **Authenticate with Google Drive**]({auth_url})
-                    
-                    *After authentication, you'll be redirected back to this app.*
-                    """)
-                    
-                    st.info("💡 Works in any tab while maintaining user isolation!")
-                    
-                    return None
-                    
-                except Exception as e:
-                    logger.error(f"🌐 CLOUD: Failed to generate auth URL: {e}")
-                    return None
-            
-        except Exception as e:
-            logger.error(f"🌐 CLOUD: Authentication failed: {e}", exc_info=True)
-            return None
 
+    # Main interface
+    st.markdown("## 🎯 Research Query")
+    st.caption("The Brain Agent will analyze your query and dynamically select appropriate tools")
+    
+    # Query input
+    query = st.text_area(
+        "Enter your research query:",
+        height=120,
+        placeholder="Examples:\n• Calculate compound interest on $50,000 at 6% for 10 years\n• Research renewable energy market trends\n• Analyze competitive landscape for AI startups"
+    )
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        submit_button = st.button("🚀 Start Brain-Heart Processing", type="primary", use_container_width=True)
+    with col2:
+        if st.button("🔄 Clear Results", use_container_width=True):
+            st.rerun()
+    with col3:
+        show_debug = st.checkbox("Debug Mode")
+    
+    # Process query with REAL agents
+    if submit_button and query.strip():
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info(f"🧠 Brain: {brain_model_config.provider}/{brain_model_config.model}")
+        with col2:
+            st.info(f"❤️ Heart: {heart_model_config.provider}/{heart_model_config.model}")
+        with col3:
+            search_type = f"Premium: {web_model_config}" if use_premium_search else "Standard: ScrapingDog/ValueSerp"
+            st.info(f"🌐 Web: {search_type}")
 
-    
-    def get_account_service(self, account_id: str) -> Optional[Any]:
-        """Get Google Drive service for specific account"""
-        try:
-            session_mgr = SessionTokenManager(self.user_id, account_id)
-            creds = session_mgr.get_google_credentials()
-            
-            if creds:
-                return build('drive', 'v3', credentials=creds)
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to get service for account {account_id}: {e}")
-            return None
-    
-    def list_files_for_account(self, account_id: str, file_type: str = None) -> List[Dict[str, Any]]:
-        """List files from specific Google Drive account"""
-        try:
-            service = self.get_account_service(account_id)
-            if not service:
-                return []
-            
-            query = "trashed=false"
-            
-            if file_type == 'documents':
-                mime_types = [
-                    'application/pdf',
-                    'application/msword',
-                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                    'text/plain',
-                    'text/csv',
-                    'application/vnd.ms-excel',
-                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                ]
-                mime_query = " or ".join([f"mimeType='{mime}'" for mime in mime_types])
-                query += f" and ({mime_query})"
-            
-            results = service.files().list(
-                q=query,
-                pageSize=50,
-                fields="files(id, name, mimeType, size, modifiedTime)"
-            ).execute()
-            
-            files = results.get('files', [])
-            # Tag files with account info
-            for file in files:
-                file['account_id'] = account_id
-            
-            logger.info(f"📂 Found {len(files)} files for account {account_id}")
-            return files
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to list files for account {account_id}: {e}")
-            return []
-    
-    def download_files_with_conflict_resolution(self, selected_files: List[Dict[str, Any]]) -> List[str]:
-        """Download files from multiple accounts with conflict resolution"""
-        try:
-            # SECURITY: Sanitize user_id and create secure temp directory
-            safe_user_id = sanitize_path_component(self.user_id)
-            user_temp_dir = create_safe_user_path(self.base_temp_path, safe_user_id)
-            os.makedirs(user_temp_dir, exist_ok=True)
-            
-            downloaded_files = []
-            filename_counts = {}  # Track filename conflicts
-            
-            for file_info in selected_files:
-                try:
-                    account_id = file_info['account_id']
-                    file_id = file_info['id']
-                    original_filename = file_info['name']
-                    
-                    service = self.get_account_service(account_id)
-                    if not service:
-                        continue
-                    
-                    # Handle filename conflicts
-                    safe_filename = self._resolve_filename_conflict(
-                        original_filename, account_id, filename_counts
-                    )
-                    filename_counts[original_filename] = filename_counts.get(original_filename, 0) + 1
-                    
-                    # SECURITY: Validate the final file path
-                    file_path = validate_safe_path(user_temp_dir, safe_filename)
-                    
-                    # Download file
-                    request = service.files().get_media(fileId=file_id)
-                    
-                    with open(file_path, 'wb') as f:
-                        downloader = MediaIoBaseDownload(f, request)
-                        done = False
-                        while done is False:
-                            status, done = downloader.next_chunk()
-                    
-                    downloaded_files.append(file_path)
-                    logger.info(f"📥 Downloaded {safe_filename} from account {account_id}")
-                    
-                except ValueError as ve:
-                    logger.error(f"❌ Security validation failed for {file_info.get('name', 'unknown')}: {ve}")
-                    continue
-                except Exception as e:
-                    logger.error(f"❌ Failed to download file {file_info.get('name', 'unknown')}: {e}")
-                    continue
-            
-            return downloaded_files
-            
-        except ValueError as ve:
-            logger.error(f"❌ Security validation failed for user {self.user_id}: {ve}")
-            return []
-        except Exception as e:
-            logger.error(f"❌ Download failed for user {self.user_id}: {e}")
-            return []
-    
-    def _resolve_filename_conflict(self, filename: str, account_id: str, filename_counts: Dict[str, int]) -> str:
-        """Resolve filename conflicts by prefixing with account info"""
-        # SECURITY: Sanitize filename first
-        safe_filename = sanitize_filename(filename)
-        
-        if filename not in filename_counts:
-            return safe_filename
-        
-        # Get file extension
-        name, ext = os.path.splitext(safe_filename)
-        
-        # SECURITY: Sanitize account_id
-        safe_account_id = sanitize_path_component(account_id)
-        
-        # Add account prefix to avoid conflicts
-        prefixed_filename = f"acc{safe_account_id}_{name}{ext}"
-        return prefixed_filename
-    
-    def cleanup_temp_files(self, full_cleanup: bool = False):
-        """Clean up temp files and optionally sessions"""
-        try:
-            # SECURITY: Sanitize user_id
-            safe_user_id = sanitize_path_component(self.user_id)
-            
-            # Clean user's temp directory with secure path
-            user_temp_dir = create_safe_user_path(self.base_temp_path, safe_user_id)
-            if os.path.exists(user_temp_dir):
-                shutil.rmtree(user_temp_dir)
-                logger.info(f"🗑️ Deleted temp directory for user {safe_user_id}")
-            
-            if full_cleanup:
-                # REVOKE ALL TOKENS BEFORE CLEANUP (ENHANCED)
-                revoked_count = self.account_manager.revoke_all_accounts()
-                logger.info(f"🔒 Revoked {revoked_count} accounts during cleanup")
+        # Create agents and process
+        with st.spinner("Creating agents and processing query..."):
+            try:
+                # Run async agent creation and processing
+                agents_result = asyncio.run(create_agents_async(config, brain_model_config, heart_model_config, web_model_config, use_premium_search))
                 
-                # Clean up accounts index with secure path
-                user_sessions_dir = validate_safe_path("sessions", safe_user_id)
-                if os.path.exists(user_sessions_dir):
-                    shutil.rmtree(user_sessions_dir)
-                
-                logger.info(f"🗑️ Full cleanup completed for user {safe_user_id}")
-                
-        except ValueError as ve:
-            logger.error(f"❌ Security validation failed during cleanup: {ve}")
-        except Exception as e:
-            logger.error(f"❌ Cleanup failed for user {self.user_id}: {e}")
-    
-    def clear_streamlit_sessions(self):
-        """Clear all Streamlit session data for this user"""
-        keys_to_remove = []
-        for key in st.session_state.keys():
-            if key.startswith(f'drive_') and self.user_id in key:
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del st.session_state[key]
-        
-        logger.info(f"🧹 Cleared Streamlit sessions for user {self.user_id}")
-        
-    def revoke_account_access(self, account_id: str) -> bool:
-        """Immediately revoke Google access for specific account"""
-        try:
-            session_mgr = SessionTokenManager(self.user_id, account_id)
-            success = session_mgr.revoke_google_tokens()
-            
-            if success:
-                # Remove from account index
-                self.account_manager.remove_account(account_id)
-                
-                # Clear Streamlit session data
-                keys_to_remove = [key for key in st.session_state.keys() if account_id in key]
-                for key in keys_to_remove:
-                    del st.session_state[key]
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to revoke account {account_id}: {e}")
-            return False
-    
-    def security_disconnect_all(self):
-        """SECURITY FEATURE: Immediately revoke ALL accounts and clean up everything"""
-        try:
-            revoked_count = self.account_manager.revoke_all_accounts()
-            
-            # Clean up temp files
-            self.cleanup_temp_files(full_cleanup=True)
-            
-            # Clear all Streamlit sessions
-            self.clear_streamlit_sessions()
-            
-            logger.info(f"🔒 Security disconnect completed: {revoked_count} accounts revoked")
-            return revoked_count
-            
-        except Exception as e:
-            logger.error(f"❌ Security disconnect failed: {e}")
-            return 0
+                if agents_result["status"] == "error":
+                    st.error(f"❌ Agent creation failed: {agents_result['error']}")
+                    logger.error(f"Agent creation failed: {agents_result}")
+                    if show_debug:
+                        st.json(agents_result)
+                else:
+                    # Process query with optimized agent
+                    
+                    if not st.session_state.get("agent_worker_started", False):
+                        try:
+                            # Call the cached start function with the actual agent
+                            start_agent_background_worker(agents_result["optimized_agent"])
+                            st.session_state["agent_worker_started"] = True
+                            logger.info("Agent background worker requested (st.session_state set).")
+                        except Exception as e:
+                            logger.error(f"Failed to start background worker: {e}")
+                            # Optionally show to user
+                            if show_debug:
+                                st.warning(f"Background worker start error: {e}")
+                                
+                    # Determine query target based on role and team
+                    if st.session_state.org_id:
+                        # Organization mode
+                        if st.session_state.org_role == "owner":
+                            # Owner uses selected_team_id from dropdown
+                            if st.session_state.selected_team_id:
+                                query_target_id = f"{st.session_state.org_id}/{st.session_state.selected_team_id}"
+                            else:
+                                query_target_id = None  # No team selected - RAG will fail gracefully
+                        elif st.session_state.org_id and st.session_state.team_id:
+                            # Team admin/member uses their assigned team
+                            query_target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+                        else:
+                            # Viewer with no team
+                            query_target_id = None  # RAG will fail gracefully
+                    else:
+                        # Personal mode
+                        query_target_id = get_user_id()
 
-
-def render_professional_ui():
-    """Add professional CSS styling"""
+                                
+                    result = asyncio.run(process_query_real(
+                        query, 
+                        agents_result["optimized_agent"], 
+                        style,
+                        user_id=query_target_id,
+                        chat_history=st.session_state.chat_history
+                    ))
+                    
+                    if result.get("success"):
+                        # Update chat history
+                        st.session_state.chat_history.extend([
+                            {"role": "user", "content": query},
+                            {"role": "assistant", "content": result.get("response", "")}
+                        ])
+                        logger.info(f"Updated chat history. Total messages: {len(st.session_state.chat_history)}")
+                    
+                    # Display real results
+                    display_real_results(result, query)
+                    
+            except Exception as e:
+                st.error(f"❌ Processing failed: {str(e)}")
+                logger.error(f"Processing failed: {str(e)}")  # ONLY ADDITION
+                if show_debug:
+                    import traceback
+                    st.code(traceback.format_exc())
+    
+    elif submit_button:
+        st.warning("⚠️ Please enter a research query.")
+    
+    # Footer
+    st.markdown("---")
     st.markdown("""
-    <style>
-    /* Account Cards */
-    .account-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 12px;
-        padding: 20px;
-        margin: 10px 0;
-        color: white;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-    }
-    
-    .account-card.inactive {
-        background: linear-gradient(135deg, #bdc3c7 0%, #95a5a6 100%);
-    }
-    
-    .account-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 10px;
-    }
-    
-    .account-email {
-        font-size: 16px;
-        font-weight: 600;
-    }
-    
-    .account-status {
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 500;
-    }
-    
-    .status-active {
-        background: #27ae60;
-    }
-    
-    .status-expired {
-        background: #e74c3c;
-    }
-    
-    /* File Browser */
-    .file-browser {
-        background: white;
-        border-radius: 8px;
-        padding: 20px;
-        margin: 15px 0;
-        border: 1px solid #e1e8ed;
-    }
-    
-    .file-item {
-        display: flex;
-        align-items: center;
-        padding: 12px;
-        border-bottom: 1px solid #f0f2f6;
-        transition: background-color 0.2s;
-    }
-    
-    .file-item:hover {
-        background-color: #f8f9fa;
-    }
-    
-    .file-icon {
-        margin-right: 12px;
-        font-size: 20px;
-    }
-    
-    /* Buttons */
-    .custom-button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border: none;
-        border-radius: 8px;
-        color: white;
-        padding: 12px 24px;
-        font-weight: 600;
-        cursor: pointer;
-        transition: transform 0.2s, box-shadow 0.2s;
-    }
-    
-    .custom-button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(0,0,0,0.15);
-    }
-    
-    /* Progress Bars */
-    .progress-container {
-        background: #f0f2f6;
-        border-radius: 10px;
-        overflow: hidden;
-        height: 8px;
-        margin: 10px 0;
-    }
-    
-    .progress-bar {
-        height: 100%;
-        background: linear-gradient(90deg, #667eea, #764ba2);
-        transition: width 0.3s ease;
-    }
-    
-    /* Stats Cards */
-    .stats-card {
-        background: white;
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
-        border: 1px solid #e1e8ed;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-    }
-    
-    .stats-number {
-        font-size: 24px;
-        font-weight: 700;
-        color: #667eea;
-    }
-    
-    .stats-label {
-        font-size: 12px;
-        color: #657786;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    </style>
+    <div style="text-align: center; color: #666; font-size: 0.9em;">
+        <strong>Brain-Heart Deep Research System v2.0</strong><br>
+        🧠 Pure LLM Orchestration • ❤️ Dynamic Synthesis • 🛠️ Real Tool Execution
+    </div>
     """, unsafe_allow_html=True)
 
 
-def render_multi_account_drive_picker(user_id: str, download_files: bool = True) -> Optional[List[str]]:
-    """Professional multi-account Google Drive picker - CLOUD OPTIMIZED"""
-    
-    # Apply professional styling
-    render_professional_ui()
-    
-    drive_manager = MultiAccountGoogleDriveManager(user_id)
-    
-    if not drive_manager.is_available():
-        st.error("❌ Google Drive not configured")
-        return None
-    
-    st.markdown("# 📁 Google Drive File Manager")
-    st.markdown("Connect multiple Google Drive accounts and manage files from a unified interface.")
-    
-    # Get user accounts
-    accounts = drive_manager.account_manager.get_user_accounts()
-    
-    # Account Management Section
-    st.markdown("## 🔗 Connected Accounts")
-    
-    if accounts:
-        # Display account cards
-        for i, account in enumerate(accounts):
-            with st.container():
-                col1, col2, col3 = st.columns([3, 1, 1])
-                
-                with col1:
-                    status_class = "active" if account['is_active'] else "inactive"
-                    status_text = "🟢 Active" if account['is_active'] else "🔴 Expired"
-                    
-                    st.markdown(f"""
-                    <div class="account-card {status_class}">
-                        <div class="account-header">
-                            <div class="account-email">{account.get('account_email', 'Unknown Email')}</div>
-                            <div class="account-status status-{'active' if account['is_active'] else 'expired'}">{status_text}</div>
-                        </div>
-                        <div>Alias: {account.get('account_alias', f'Account {i+1}')}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    if not account['is_active']:
-                        if st.button(f"🔄 Reconnect", key=f"reconnect_{account['account_id']}"):
-                            # Remove old session and reconnect
-                            drive_manager.account_manager.remove_account(account['account_id'])
-                            new_account_id = drive_manager.authenticate_account(account['account_alias'])
-                            if new_account_id:
-                                st.success(f"✅ Reconnected {account['account_alias']}")
-                                st.rerun()
-                            else:
-                                st.error("❌ Reconnection failed")
-                
-                with col3:
-                    if st.button(f"🗑️ Remove", key=f"remove_{account['account_id']}"):
-                        # REVOKE TOKENS BEFORE REMOVAL (NEW)
-                        drive_manager.revoke_account_access(account['account_id'])
-                        
-                        # Clear related Streamlit session data
-                        keys_to_remove = [key for key in st.session_state.keys() if account['account_id'] in key]
-                        for key in keys_to_remove:
-                            del st.session_state[key]
-                        st.success(f"Removed and revoked {account['account_alias']}")
-                        st.rerun()
-    # Add security disconnect button
-    st.markdown("---")
-    
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("🔒 Security Disconnect All", type="secondary", help="Immediately revoke ALL Google access"):
-            # Use session state for confirmation
-            if 'confirm_disconnect_all' not in st.session_state:
-                st.session_state.confirm_disconnect_all = False
-
-            if not st.session_state.confirm_disconnect_all:
-                st.session_state.confirm_disconnect_all = True
-                st.error("⚠️ This will immediately revoke ALL Google Drive access!")
-                st.info("Click the button again to confirm.")
-                st.rerun()
-            else:
-                # User confirmed, proceed
-                st.session_state.confirm_disconnect_all = False
-            drive_manager = MultiAccountGoogleDriveManager(user_id)
-            revoked_count = drive_manager.security_disconnect_all()
-            
-            if revoked_count > 0:
-                st.success(f"✅ Successfully revoked {revoked_count} Google accounts")
-                st.info("🛡️ All tokens have been immediately invalidated at Google")
-                st.rerun()
-            else:
-                st.warning("No active accounts to revoke")
-    
-    with col2:
-        # Individual account revoke in the remove button
-        # (Already implemented in your existing remove logic)
-        pass
-    
-    # Add new account button
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("➕ Add Google Account", type="primary"):
-            with st.spinner("🔐 Authenticating new account..."):
-                # Auto-generate account alias without user input
-                account_count = len(accounts) + 1
-                account_alias = f"Account {account_count}"
-                
-                account_id = drive_manager.authenticate_account(account_alias)
-                if account_id:
-                    st.success("✅ Account added successfully!")
-                    st.rerun()
-                else:
-                    st.error("❌ Authentication failed")
-    
-    # File Browser Section
-    if accounts and any(acc['is_active'] for acc in accounts):
-        st.markdown("---")
-        st.markdown("## 📂 File Browser")
-        
-        # Load files from all active accounts
-        all_files = []
-        active_accounts = [acc for acc in accounts if acc['is_active']]
-        
-        for account in active_accounts:
-            account_id = account['account_id']
-            cache_key = f'drive_files_{user_id}_{account_id}'
-            
-            if cache_key not in st.session_state:
-                with st.spinner(f"Loading files from {account['account_alias']}..."):
-                    files = drive_manager.list_files_for_account(account_id, file_type='documents')
-                    st.session_state[cache_key] = files
-            
-            account_files = st.session_state[cache_key]
-            for file in account_files:
-                file['account_alias'] = account['account_alias']
-                file['account_email'] = account['account_email']
-            all_files.extend(account_files)
-        
-        if all_files:
-            # Stats
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(f"""
-                <div class="stats-card">
-                    <div class="stats-number">{len(all_files)}</div>
-                    <div class="stats-label">Total Files</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown(f"""
-                <div class="stats-card">
-                    <div class="stats-number">{len(active_accounts)}</div>
-                    <div class="stats-label">Active Accounts</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col3:
-                total_size = sum(int(f.get('size', 0)) for f in all_files) / (1024 * 1024)
-                st.markdown(f"""
-                <div class="stats-card">
-                    <div class="stats-number">{total_size:.1f}MB</div>
-                    <div class="stats-label">Total Size</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("### Select Files")
-            
-            # File selection with improved UI
-            selected_files = []
-            
-            # Group files by account
-            for account in active_accounts:
-                account_files = [f for f in all_files if f['account_id'] == account['account_id']]
-                if account_files:
-                    with st.expander(f"📁 {account['account_alias']} ({len(account_files)} files)", expanded=True):
-                        for file in account_files:
-                            col1, col2, col3 = st.columns([4, 2, 1])
-                            
-                            with col1:
-                                if st.checkbox(
-                                    f"📄 {file['name']}", 
-                                    key=f"file_{user_id}_{file['account_id']}_{file['id']}"
-                                ):
-                                    selected_files.append(file)
-                            
-                            with col2:
-                                size_mb = int(file.get('size', 0)) / (1024 * 1024) if file.get('size') else 0
-                                st.caption(f"{size_mb:.1f} MB")
-                            
-                            with col3:
-                                st.caption(f"🏷️ {account['account_alias'][:8]}...")
-            
-            # Action buttons
-            if selected_files:
-                st.markdown("---")
-                col1, col2, col3 = st.columns([2, 1, 1])
-                
-                with col1:
-                    st.info(f"📋 Selected {len(selected_files)} files from {len(set(f['account_id'] for f in selected_files))} accounts")
-                
-                with col2:
-                    if download_files:
-                        if st.button("✅ Use Selected Files", type="primary", key="use_selected"):
-                            with st.spinner("Downloading files..."):
-                                downloaded_paths = drive_manager.download_files_with_conflict_resolution(selected_files)
-                                
-                                if downloaded_paths:
-                                    st.success(f"✅ Downloaded {len(downloaded_paths)} files")
-                                    st.session_state[f'drive_downloaded_files_{user_id}'] = downloaded_paths
-                                    st.rerun()
-                                else:
-                                    st.error("❌ Download failed")
-                    else:
-                        # Just return selected files metadata (no download)
-                        st.session_state[f'drive_selected_files_{user_id}'] = selected_files
-                        st.success(f"✅ Selected {len(selected_files)} files (ready for download)")
-                
-                with col3:
-                    if st.button("🔄 Refresh All", key="refresh_all"):
-                        # Clear all file caches
-                        keys_to_remove = [key for key in st.session_state.keys() if key.startswith(f'drive_files_{user_id}_')]
-                        for key in keys_to_remove:
-                            del st.session_state[key]
-                        st.rerun()
-        
-        else:
-            st.info("No supported files found in connected accounts")
-    
-    elif accounts:
-        st.warning("⚠️ All accounts have expired sessions. Please reconnect them.")
-    
-    else:
-        st.info("🔗 Add your first Google Drive account to get started")
-    
-    # Return downloaded files OR selected files
-    if download_files:
-        return st.session_state.get(f'drive_downloaded_files_{user_id}')
-    else:
-        return st.session_state.get(f'drive_selected_files_{user_id}')
-
-
-def cleanup_multi_account_session(user_id: str, keep_connection: bool = False):
-    """Clean up multi-account session data"""
-    logger.info(f"🧹 Multi-account cleanup for user: {user_id}, keep_connection: {keep_connection}")
-    
-    drive_manager = MultiAccountGoogleDriveManager(user_id)
-    
-    if keep_connection:
-        # Only clear downloaded files
-        if f'drive_downloaded_files_{user_id}' in st.session_state:
-            del st.session_state[f'drive_downloaded_files_{user_id}']
-        drive_manager.cleanup_temp_files(full_cleanup=False)
-    else:
-        # Full cleanup
-        drive_manager.clear_streamlit_sessions()
-        drive_manager.cleanup_temp_files(full_cleanup=True)
-    
-    logger.info(f"✅ Multi-account cleanup completed for user: {user_id}")
+if __name__ == "__main__":
+    main()

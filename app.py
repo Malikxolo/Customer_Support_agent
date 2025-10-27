@@ -22,12 +22,14 @@ from chroma_log_handler import ChromaLogHandler
 from dotenv import load_dotenv
 import aiohttp
 from core.google_drive_integration import render_multi_account_drive_picker, cleanup_multi_account_session
-from core.path_security import (
-    sanitize_path_component,
-    sanitize_filename,
-    validate_safe_path,
-    create_safe_user_path
+from core.organization_manager import (
+    create_organization, 
+    join_organization, 
+    check_permission,
+    get_organization,
+    org_manager
 )
+
 
 load_dotenv()
 
@@ -67,7 +69,34 @@ async def mog_query(user_id: str, chat_history:List, query: str):
 # Initialize user_id FIRST (before logging)
 if 'user_id' not in st.session_state:
     st.session_state.user_id = str(uuid.uuid4())
+    
+if 'org_id' not in st.session_state:
+    st.session_state.org_id = None
+    
+if 'org_role' not in st.session_state:
+    st.session_state.org_role = None
+    
+if 'user_name' not in st.session_state:
+    st.session_state.user_name = None
+    
+if 'show_create_org' not in st.session_state:
+    st.session_state.show_create_org = False
+    
+if 'show_join_org' not in st.session_state:
+    st.session_state.show_join_org = False
+    
+if 'show_transfer_admin' not in st.session_state:
+    st.session_state.show_transfer_admin = False
 
+if 'team_id' not in st.session_state:
+    st.session_state.team_id = None  
+
+if 'selected_team_id' not in st.session_state:
+    st.session_state.selected_team_id = None  
+
+if 'show_create_team_dialog' not in st.session_state:
+    st.session_state.show_create_team_dialog = False
+    
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(name)s %(levelname)s: %(message)s',
@@ -228,6 +257,34 @@ def get_user_id():
         logger.info(f"New user session: {st.session_state.user_id}")
     return st.session_state.user_id
 
+def sync_user_role():
+    """Sync user role and team from organizations.json if in org"""
+    if st.session_state.get('org_id'):
+        org = get_organization(st.session_state.org_id)
+        if org:
+            user_id = get_user_id()
+            members = org.get("members", {})
+            
+            if user_id in members:
+                # Update session with latest role from JSON
+                latest_role = members[user_id]["role"]
+                if st.session_state.org_role != latest_role:
+                    st.session_state.org_role = latest_role
+                
+                # UPDATE: Sync team_id
+                latest_team_id = members[user_id].get("team_id")
+                if st.session_state.team_id != latest_team_id:
+                    st.session_state.team_id = latest_team_id
+            else:
+                # User removed from org - clear session
+                st.session_state.org_id = None
+                st.session_state.org_role = None
+                st.session_state.user_name = None
+                st.session_state.team_id = None  # ← ADD THIS
+                st.session_state.selected_team_id = None  # ← ADD THIS
+
+
+
 def get_user_collections(user_id: str) -> List[str]:
     """Get user's collections"""
     try:
@@ -244,25 +301,20 @@ def display_collection_name(user_id: str, namespaced_name: str) -> str:
     from core.knowledge_base import get_display_collection_name
     return get_display_collection_name(user_id, namespaced_name)
 
-def create_collection(user_id: str, collection_name: str, files: List):
+def create_collection(target_id: str, collection_name: str, files: List):
     """Create new collection from uploaded files - ENHANCED VERSION WITH CLOUD CLEANUP"""
     try:
         from core.knowledge_base import kb_manager
         from core.knowledge_base import create_knowledge_base
         
-        # SECURITY: Sanitize user inputs
-        safe_user_id = sanitize_path_component(user_id)
-        safe_collection_name = sanitize_path_component(collection_name)
-        
-        # Create user directory with secure path
-        user_path = create_safe_user_path("db_collection", safe_user_id)
+        user_path = f"db_collection/{target_id}"
         os.makedirs(user_path, exist_ok=True)
         
         # STEP 1: Delete ALL existing Chroma Cloud collections for this user
         try:
             client = kb_manager._get_chroma_client()
             all_collections = client.list_collections()
-            user_prefix = f"{safe_user_id}_"
+            user_prefix = f"{target_id}_"
             
             for collection in all_collections:
                 if collection.name.startswith(user_prefix):
@@ -296,7 +348,7 @@ def create_collection(user_id: str, collection_name: str, files: List):
         logger.info(f"Saved {len(files)} files for processing")
         
         # STEP 4: Create vector database using your knowledge_base.py logic
-        result = create_knowledge_base(safe_user_id, safe_collection_name, file_paths)
+        result = create_knowledge_base(target_id, collection_name, file_paths)
         
         if result["success"]:
             logger.info(f"Knowledge base created successfully: {safe_collection_name}")
@@ -314,56 +366,384 @@ def create_collection(user_id: str, collection_name: str, files: List):
         logger.error(f"Failed to create collection: {e}")
         return False
 
-def render_rag_sidebar():
-    """Render RAG UI in sidebar - ONLY ADDITION"""
-    user_id = get_user_id()
-    collections = get_user_collections(user_id)
+def show_create_org_form():
+    """Form to create new organization"""
+    st.header("🏢 Create Organization")
     
-    st.markdown("### 📚 RAG Configuration")
-    
-    if collections:
-        collection_name = collections[0]
-        clean_name = display_collection_name(user_id, collection_name)
-        st.success(f"Active: {clean_name}")
+    with st.form("create_org_form"):
+        org_name = st.text_input(
+            "Organization Name",
+            placeholder="e.g., Acme Corporation"
+        )
         
-        # Show file count
-        try:
-            # SECURITY: Use sanitized paths
-            safe_user_id = sanitize_path_component(user_id)
-            safe_collection_name = sanitize_path_component(collection_name)
-            
-            metadata_path = validate_safe_path(
-                "db_collection",
-                safe_user_id,
-                safe_collection_name,
-                "metadata.json"
+        user_name = st.text_input(
+            "Your Name",
+            placeholder="e.g., John Smith"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("Create", use_container_width=True)
+        with col2:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+        
+        if cancel:
+            st.session_state.show_create_org = False
+            st.rerun()
+        
+        if submitted:
+            if not org_name or not user_name:
+                st.error("Please fill in all fields")
+            else:
+                user_id = get_user_id()
+                result = create_organization(org_name, user_name, user_id)
+                
+                if result["success"]:
+                    st.session_state.org_id = result["org_id"]
+                    st.session_state.org_role = result["role"]
+                    st.session_state.user_name = user_name
+                    st.session_state.show_create_org = False
+                    
+                    st.success(f"✅ Organization '{org_name}' created!")
+                    st.info(f"🎟️ **Invite Code:** `{result['invite_code']}`")
+                    st.caption("Share this code with your team")
+                    
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+
+
+def show_join_org_form():
+    """Form to join existing organization"""
+    st.header("🔗 Join Organization")
+    
+    with st.form("join_org_form"):
+        user_name = st.text_input(
+            "Your Name",
+            placeholder="e.g., Sarah Johnson"
+        )
+        
+        invite_code = st.text_input(
+            "Invite Code",
+            placeholder="e.g., ACM5H2K9",
+            max_chars=8
+        ).upper()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("Join", use_container_width=True)
+        with col2:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+        
+        if cancel:
+            st.session_state.show_join_org = False
+            st.rerun()
+        
+        if submitted:
+            if not user_name or not invite_code:
+                st.error("Please fill in all fields")
+            else:
+                user_id = get_user_id()
+                result = join_organization(invite_code, user_name, user_id)
+                
+                if result["success"]:
+                    st.session_state.org_id = result["org_id"]
+                    st.session_state.org_role = result["role"]
+                    st.session_state.user_name = user_name
+                    st.session_state.show_join_org = False
+                    
+                    st.success(f"✅ Joined '{result['org_name']}'!")
+                    st.info(f"Your role: {result['role'].title()}")
+                    
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+
+
+def upload_to_organization():
+    """Upload documents to organization KB (owner/team admin)"""
+    if not st.session_state.org_id:
+        st.warning("Join an organization first")
+        return
+    
+    user_id = get_user_id()
+    
+    # Determine upload target
+    upload_target_id = None
+    upload_team_name = None
+    
+    if check_permission(st.session_state.org_id, get_user_id(), "upload_documents"):
+        # Owner selects team to upload to
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if not teams:
+            st.warning("⚠️ Create teams first in Team Management")
+            if st.button("Go to Team Management"):
+                st.session_state['show_team_management'] = True
+                st.rerun()
+            return
+        
+        st.subheader("📤 Upload to Team")
+        team_options = {t["team_id"]: t["team_name"] for t in teams}
+        
+        selected_team = st.selectbox(
+            "Select team:",
+            list(team_options.keys()),
+            format_func=lambda x: team_options[x],
+            key="owner_upload_team_selector"
+        )
+        
+        upload_target_id = f"{st.session_state.org_id}/{selected_team}"
+        upload_team_name = team_options[selected_team]
+        
+    elif st.session_state.org_role == "team_admin":
+        # Team admin uploads to their team
+        if not st.session_state.team_id:
+            st.error("You're not assigned to a team")
+            return
+        
+        upload_target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+        
+        # Get team name
+        org = get_organization(st.session_state.org_id)
+        teams = org.get("teams", {})
+        if st.session_state.team_id in teams:
+            upload_team_name = teams[st.session_state.team_id]["team_name"]
+        else:
+            upload_team_name = "Your Team"
+        
+        st.subheader(f"📤 Upload to {upload_team_name}")
+    else:
+        st.error("❌ Only owner and team admins can upload")
+        return
+    
+    # Show target info
+    st.info(f"📁 Uploading to: **{upload_team_name}**")
+    
+    collection_name = st.text_input(
+        "Collection Name", 
+        value="team_knowledge",
+        key="org_collection_name"
+    )
+    
+    uploaded_files = st.file_uploader(
+        "Upload Documents",
+        accept_multiple_files=True,
+        type=["txt", "pdf", "docx", "doc", "md", "csv", "json"],
+        key="org_file_uploader"
+    )
+    
+    if uploaded_files and st.button("Upload to Organization", key="org_upload_btn"):
+        with st.spinner(f"Uploading to {upload_team_name}..."):
+            result = upload_local_files(
+                user_id=upload_target_id,  # ← Uses org_id/team_id format!
+                collection_name=collection_name,
+                files=uploaded_files
             )
             
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
-                st.info(f"Files: {metadata.get('file_count', 0)}")
-        except ValueError as ve:
-            logger.error(f"Security validation failed: {ve}")
-        except Exception as e:
-            logger.error(f"Error reading metadata: {e}")
-            
-        if st.button("✏️ Edit Collection"):
-            st.session_state.show_edit = True
-            st.session_state.show_upload = False
-            
-        if st.button("🔄 Replace Collection"):
-            st.session_state.show_upload = True
-            st.session_state.show_edit = False
+            if result.get("success"):
+                st.success(f"✅ Uploaded {len(uploaded_files)} files to {upload_team_name}!")
+                st.info(f"Team members of {upload_team_name} can now access these documents")
+            else:
+                st.error(f"❌ Upload failed: {result.get('error')}")
+
+def render_rag_sidebar():
+    """RAG Configuration - Fully integrated with organization features"""
+    st.sidebar.markdown("---")
+    
+    # Determine mode and title
+    if st.session_state.org_id:
+        org = get_organization(st.session_state.org_id)
+        if org:
+            st.sidebar.subheader(f"📚 RAG ({org['org_name']})")
+            st.sidebar.caption(f"Role: {st.session_state.org_role.title()}")
+        else:
+            st.sidebar.subheader("📚 RAG Configuration")
     else:
-        st.info("No collection loaded")
-        st.warning("RAG tool disabled")
-        if st.button("📁 Create Collection"):
-            st.session_state.show_upload = True
-            st.session_state.show_edit = False
+        st.sidebar.subheader("📚 RAG Configuration")
+    
+    # NEW - Match your UPLOAD and QUERY logic:
+    if st.session_state.org_id:
+        if st.session_state.team_id:
+            # Team admin/member - use org_id/team_id
+            target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+        elif st.session_state.org_role == "owner" and st.session_state.selected_team_id:
+            # Owner with team selection
+            target_id = f"{st.session_state.org_id}/{st.session_state.selected_team_id}"
+        else:
+            # No team context
+            target_id = None  # Fallback to org level
+    else:
+        target_id = get_user_id()
+    
+    # Get collections using local file check (fast!)
+    collections = get_user_collections(target_id)
 
 
+    # Show collection status
+    if collections:
+        collection_name = collections[0]
+        clean_name = display_collection_name(target_id, collection_name)
+        mode_label = "org" if st.session_state.org_id else "personal"
+        st.sidebar.success(f"✅ Active: {clean_name} ({mode_label})")
+    else:
+        if st.session_state.org_id:
+            st.sidebar.info("No org collection loaded")
+        else:
+            st.sidebar.info("No collection loaded")
 
+    # OWNER BUTTONS (Always visible - NOT dependent on collections)
+    if st.session_state.org_id and check_permission(st.session_state.org_id, get_user_id(), "view_invite_code"):
+        # CREATE TEAM - Always visible
+        if st.sidebar.button("🏗️ Create Team", key="create_team_btn"):
+            st.session_state['show_create_team_dialog'] = True
+            st.rerun()
+        
+        # MANAGE TEAMS - Only if teams exist
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            if st.sidebar.button("👥 Manage Teams", key="manage_teams"):
+                st.session_state['show_team_management'] = True
+                st.rerun()
+
+    # EDIT COLLECTION - Only if collection exists
+    if collections:
+        if st.session_state.org_id:
+            if check_permission(st.session_state.org_id, get_user_id(), "edit_collection"):
+                if st.sidebar.button("✏️ Edit Collection", key="edit_org"):
+                    st.session_state['show_edit'] = True
+                    st.rerun()
+            else:
+                st.sidebar.button("🔒 Edit (Owner/Team Admin Only)", disabled=True, key="edit_disabled")
+        else:
+            # Personal mode edit
+            if st.sidebar.button("✏️ Edit Collection", key="edit_personal"):
+                st.session_state['show_edit'] = True
+                st.rerun()
+
+    
+    # Show org info if in organization
+    if st.session_state.org_id:
+        org = get_organization(st.session_state.org_id)
+        if org:
+            # Compact org details
+            col1, col2 = st.sidebar.columns([2, 1])
+            with col1:
+                if check_permission(st.session_state.org_id, get_user_id(), "view_invite_code"):
+                    with st.sidebar.expander("🔑 Invite Code"):
+                        st.code(org["invite_code"])
+                        st.caption("Share with team")
+            with col2:
+                member_count = org_manager.get_member_count(st.session_state.org_id)
+                st.sidebar.write(f"👥 {member_count}")    
+            # Show collection info
+            if st.session_state.org_id:
+                # Organization mode
+                org = get_organization(st.session_state.org_id)
+                if org:
+                    org_name = org["org_name"]
+                    st.sidebar.markdown(f"**🏢 {org_name}**")
+                    st.sidebar.markdown(f"*Role: {st.session_state.org_role.title()}*")
+                
+                # ADD THIS: Team selector for owner
+                if st.session_state.org_role == "owner":
+                    org = get_organization(st.session_state.org_id)
+                    teams = org_manager.get_teams(st.session_state.org_id)
+                    
+                    if teams:
+                        st.sidebar.markdown("---")
+                        st.sidebar.markdown("**Query Team:**")
+                        
+                        team_options = {team["team_id"]: team["team_name"] for team in teams}
+                        team_ids = list(team_options.keys())
+                        team_names = list(team_options.values())
+                        
+                        # Default to first team if not selected
+                        if not st.session_state.selected_team_id and team_ids:
+                            st.session_state.selected_team_id = team_ids[0]
+                        
+                        selected_index = team_ids.index(st.session_state.selected_team_id) if st.session_state.selected_team_id in team_ids else 0
+                        
+                        selected_team = st.sidebar.selectbox(
+                            "Select team to query:",
+                            team_names,
+                            index=selected_index,
+                            key="team_selector"
+                        )
+                        
+                        # Update selected team
+                        st.session_state.selected_team_id = team_ids[team_names.index(selected_team)]
+                        
+                        st.sidebar.info(f"✅ Querying: {selected_team}")
+                    else:
+                        st.sidebar.warning("No teams created yet")
+                elif st.session_state.team_id:
+                    # Team member/admin - show their team
+                    org = get_organization(st.session_state.org_id)
+                    teams = org.get("teams", {})
+                    if st.session_state.team_id in teams:
+                        team_name = teams[st.session_state.team_id]["team_name"]
+                        st.sidebar.info(f"📁 Team: {team_name}")
+                else:
+                    # Unassigned member
+                    st.sidebar.warning("⏳ Not assigned to a team")
+                    
+            # Leave organization button (different for admin vs viewer)
+            if st.session_state.org_role == "owner":
+                if st.sidebar.button("← Leave Organization", key="leave_org_admin"):
+                    st.session_state['show_transfer_admin'] = True
+                    st.rerun()
+            else:
+                # Viewer can leave directly
+                if st.sidebar.button("← Leave Organization", key="leave_org_viewer"):
+                    org_manager.remove_member(st.session_state.org_id, get_user_id())
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.success("Left organization")
+                    time.sleep(1)
+                    st.rerun()
+
+            
+            st.sidebar.markdown("---")
+    
+    # THREE MAIN BUTTONS (context-aware)
+    # Button 1: Create Collection
+    if st.session_state.org_id:
+        # In organization mode
+        if check_permission(st.session_state.org_id, get_user_id(), "upload_documents"):
+            button_label = "Create Collection (Org)"
+            button_disabled = False
+            button_key = "create_org_collection"
+        else:
+            button_label = "🔒 Create Collection (Owner/Team Admin Only)"
+            button_disabled = True
+            button_key = "create_disabled_viewer"
+
+    else:
+        # Personal mode
+        button_label = "📁 Create Collection"
+        button_disabled = False
+        button_key = "create_personal_collection"
+    
+    if st.sidebar.button(button_label, disabled=button_disabled, key=button_key, use_container_width=True):
+        st.session_state['show_upload'] = True
+        st.rerun()
+    
+    # Button 2 & 3: Create/Join Organization (only if NOT in org)
+    if not st.session_state.org_id:
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            if st.button("🏢 Create Org", key="create_org_sidebar", use_container_width=True):
+                st.session_state.show_create_org = True
+                st.rerun()
+        
+        with col2:
+            if st.button("🔗 Join Org", key="join_org_sidebar", use_container_width=True):
+                st.session_state.show_join_org = True
+                st.rerun()
 
 # Import core system
 try:
@@ -582,7 +962,199 @@ def display_real_results(result: Dict[str, Any], query: str):
         st.markdown("### 🔍 Complete Raw Data")
         st.json(result)
 
-
+def show_team_management_panel():
+    """Team management panel for organization owner"""
+    st.markdown("# 👥 Team Management")
+    
+    org = get_organization(st.session_state.org_id)
+    if not org:
+        st.error("Organization not found")
+        return
+    
+    user_id = get_user_id()
+    
+    # Check if owner
+    if org["owner_id"] != user_id:
+        st.error("Only owner can manage teams")
+        return
+    
+    # Close button
+    if st.button("← Back to Chat"):
+        st.session_state['show_team_management'] = False
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Tabs for different sections
+    tab1, tab2, tab3 = st.tabs(["📋 Teams", "👥 Unassigned Members", "🗑️ Delete Team"])
+    
+    # TAB 1: Create & Manage Teams
+    with tab1:
+        st.markdown("### Create New Team")
+        with st.form("create_team_form"):
+            team_name = st.text_input("Team Name", placeholder="DevOps Team")
+            submit = st.form_submit_button("Create Team")
+            
+            if submit and team_name:
+                result = org_manager.create_team(
+                    st.session_state.org_id,
+                    team_name,
+                    user_id
+                )
+                if result["success"]:
+                    st.success(f"✅ Team '{team_name}' created!")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
+        
+        st.markdown("---")
+        st.markdown("### Existing Teams")
+        
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            for team in teams:
+                with st.expander(f"📁 {team['team_name']}", expanded=False):
+                    team_members = org_manager.get_team_members(
+                        st.session_state.org_id,
+                        team["team_id"]
+                    )
+                    
+                    # Team admin info
+                    team_admin_id = team.get("team_admin_id")
+                    if team_admin_id:
+                        admin_name = next(
+                            (m["name"] for m in team_members if m["user_id"] == team_admin_id),
+                            "Unknown"
+                        )
+                        st.info(f"👑 Admin: {admin_name}")
+                    else:
+                        st.warning("⚠️ No team admin assigned")
+                    
+                    st.markdown(f"**Members ({len(team_members)}):**")
+                    
+                    if team_members:
+                        for member in team_members:
+                            col1, col2, col3 = st.columns([3, 2, 1])
+                            with col1:
+                                role_icon = "👑" if member["role"] == "team_admin" else "👤"
+                                st.write(f"{role_icon} {member['name']}")
+                            with col2:
+                                st.caption(member['role'].replace('_', ' ').title())
+                            with col3:
+                                if st.button("Remove", key=f"remove_{team['team_id']}_{member['user_id']}"):
+                                    result = org_manager.remove_member_from_team(
+                                        st.session_state.org_id,
+                                        team["team_id"],
+                                        member["user_id"],
+                                        user_id
+                                    )
+                                    if result["success"]:
+                                        st.success("Member removed")
+                                        st.rerun()
+                                    else:
+                                        st.error(result["error"])
+                    else:
+                        st.caption("No members yet")
+                    
+                    # Assign team admin
+                    st.markdown("---")
+                    st.markdown("**Assign Team Admin:**")
+                    if team_members:
+                        member_options = {m["user_id"]: m["name"] for m in team_members}
+                        selected_admin = st.selectbox(
+                            "Choose admin:",
+                            list(member_options.keys()),
+                            format_func=lambda x: member_options[x],
+                            key=f"admin_select_{team['team_id']}"
+                        )
+                        if st.button("Set as Admin", key=f"set_admin_{team['team_id']}"):
+                            result = org_manager.assign_team_admin(
+                                st.session_state.org_id,
+                                team["team_id"],
+                                selected_admin,
+                                user_id
+                            )
+                            if result["success"]:
+                                st.success("Team admin assigned!")
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+        else:
+            st.info("No teams created yet")
+    
+    # TAB 2: Unassigned Members
+    with tab2:
+        st.markdown("### Unassigned Members")
+        unassigned = org_manager.get_unassigned_members(st.session_state.org_id)
+        teams = org_manager.get_teams(st.session_state.org_id)
+        
+        if unassigned and teams:
+            for member in unassigned:
+                with st.container():
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        st.write(f"👤 {member['name']}")
+                    with col2:
+                        team_options = {t["team_id"]: t["team_name"] for t in teams}
+                        selected_team = st.selectbox(
+                            "Assign to:",
+                            list(team_options.keys()),
+                            format_func=lambda x: team_options[x],
+                            key=f"assign_{member['user_id']}"
+                        )
+                        if st.button("Assign", key=f"assign_btn_{member['user_id']}"):
+                            result = org_manager.add_member_to_team(
+                                st.session_state.org_id,
+                                selected_team,
+                                member["user_id"],
+                                user_id
+                            )
+                            if result["success"]:
+                                st.success("Member assigned!")
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+                    st.markdown("---")
+        elif not teams:
+            st.warning("Create teams first")
+        else:
+            st.info("All members are assigned to teams")
+    
+    # TAB 3: Delete Team
+    with tab3:
+        st.markdown("### Delete Team")
+        st.warning("⚠️ Teams can only be deleted if they have no members")
+        
+        teams = org_manager.get_teams(st.session_state.org_id)
+        if teams:
+            team_options = {t["team_id"]: t["team_name"] for t in teams}
+            selected_team = st.selectbox(
+                "Select team to delete:",
+                list(team_options.keys()),
+                format_func=lambda x: team_options[x],
+                key="delete_team_select"
+            )
+            
+            # Show team member count
+            team_members = org_manager.get_team_members(
+                st.session_state.org_id,
+                selected_team
+            )
+            st.info(f"Members in team: {len(team_members)}")
+            
+            if st.button("🗑️ Delete Team", type="primary"):
+                result = org_manager.delete_team(
+                    st.session_state.org_id,
+                    selected_team,
+                    user_id
+                )
+                if result["success"]:
+                    st.success("Team deleted!")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
+        else:
+            st.info("No teams to delete")
 
 def main():
     """Main Streamlit application - REAL Brain-Heart system"""
@@ -600,6 +1172,151 @@ def main():
     st.markdown("# 🧠❤️ Brain-Heart Deep Research System")
     st.markdown("### Pure LLM Architecture - Agents Think, Tools Execute")
     
+    # Sync user role with JSON file
+    sync_user_role()
+    
+    # Show org forms if active
+    if st.session_state.get("show_create_org"):
+        show_create_org_form()
+        st.stop()
+
+    if st.session_state.get("show_join_org"):
+        show_join_org_form()
+        st.stop()
+    # CREATE TEAM DIALOG
+    if st.session_state.get("show_create_team_dialog"):
+        st.markdown("## 🏗️ Create New Team")
+        
+        with st.form("quick_create_team_form"):
+            team_name = st.text_input("Team Name", placeholder="e.g., DevOps Team")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                submit = st.form_submit_button("✅ Create Team", use_container_width=True)
+            with col2:
+                cancel = st.form_submit_button("❌ Cancel", use_container_width=True)
+            
+            if cancel:
+                st.session_state['show_create_team_dialog'] = False
+                st.rerun()
+            
+            if submit and team_name:
+                result = org_manager.create_team(
+                    st.session_state.org_id,
+                    team_name,
+                    get_user_id()
+                )
+                
+                if result["success"]:
+                    st.success(f"✅ Team '{team_name}' created successfully!")
+                    st.session_state['show_create_team_dialog'] = False
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+        
+        st.stop()
+
+    # Show team management panel
+    if st.session_state.get("show_team_management"):
+        show_team_management_panel()
+        st.stop()
+        
+    # TRANSFER ADMIN ROLE DIALOG
+    if st.session_state.get('show_transfer_admin'):
+        st.markdown("---")
+        
+        org = get_organization(st.session_state.org_id)
+        members = org.get("members", {})
+        
+        # Get other members (exclude current admin)
+        current_user_id = get_user_id()
+        other_members = {uid: info for uid, info in members.items() if uid != current_user_id}
+        
+        if not other_members:
+            # Admin is alone - allow delete
+            st.warning("⚠️ You are the only member in this organization")
+            st.markdown("**You can:**")
+            st.markdown("- Delete the organization (will remove all data)")
+            st.markdown("- Cancel and stay as admin")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Delete Organization", key="delete_org_solo"):
+                    org_id = st.session_state.org_id
+                    
+                    # Delete org files
+                    import shutil
+                    org_path = f"db_collection/{org_id}"
+                    if os.path.exists(org_path):
+                        shutil.rmtree(org_path)
+                    
+                    # Delete from JSON
+                    org_manager.delete_organization(org_id)
+                    
+                    # Clear session
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.session_state['show_transfer_admin'] = False
+                    
+                    st.success("✅ Organization deleted")
+                    time.sleep(2)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel", key="cancel_delete_solo"):
+                    st.session_state['show_transfer_admin'] = False
+                    st.rerun()
+        
+        else:
+            # Has members - must transfer admin
+            st.info(f"👥 Transfer admin role to continue")
+            st.markdown(f"**Organization:** {org['org_name']}")
+            st.markdown(f"**Members:** {len(other_members)}")
+            
+            # Create member list for selection
+            member_options = []
+            member_ids = []
+            for uid, info in other_members.items():
+                member_options.append(f"{info['name']} (Viewer)")
+                member_ids.append(uid)
+            
+            selected = st.selectbox("Select new admin:", member_options, key="select_new_admin")
+            selected_index = member_options.index(selected)
+            new_admin_id = member_ids[selected_index]
+            
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("✅ Transfer & Leave", key="confirm_transfer"):
+                    # Transfer admin role
+                    org_manager.transfer_admin(
+                        st.session_state.org_id, 
+                        current_user_id, 
+                        new_admin_id
+                    )
+                    
+                    # Clear session
+                    st.session_state.org_id = None
+                    st.session_state.org_role = None
+                    st.session_state.user_name = None
+                    st.session_state['show_transfer_admin'] = False
+                    
+                    new_admin_name = selected.split(' (')[0]
+                    st.success(f"✅ Admin transferred to {new_admin_name}")
+                    st.info("You have left the organization")
+                    time.sleep(2)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel", key="cancel_transfer"):
+                    st.session_state['show_transfer_admin'] = False
+                    st.rerun()
+        
+        st.stop()
+
     # Initialize configuration
     config_result = initialize_config()
     
@@ -622,7 +1339,7 @@ def main():
             st.session_state['chat_history'] = []  
             st.success("Chat cleared!")
             st.rerun()
-            
+                        
         st.markdown("## 🎛️ Model Configuration")
         
         available_providers = config.get_available_providers()
@@ -691,11 +1408,35 @@ def main():
             st.markdown(f"{status} {tool_name}")
             if tool_name == "web_search" and tool_config.get("enabled"):
                 st.caption(f"   Model: {web_model_config}")
-    
+
     # FILE UPLOAD INTERFACE - ONLY ADDITION  
     if st.session_state.get('show_upload', False):
         st.markdown("---")
-        st.markdown("## 📤 Upload Documents for RAG")
+        # Determine mode and target
+        if st.session_state.org_id:
+            if st.session_state.team_id:
+                target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+            elif st.session_state.org_role == "owner" and st.session_state.selected_team_id:
+                target_id = f"{st.session_state.org_id}/{st.session_state.selected_team_id}"
+            else:
+                target_id = None
+            mode = "Organization"
+            
+            # Permission check
+            if not check_permission(st.session_state.org_id, get_user_id(), "upload_documents"):
+                st.error("⛔ Only owner and team admins can edit organization collections")
+                if st.button("Close", key="close_upload_error"):
+                    st.session_state['show_upload'] = False
+                    st.rerun()
+                st.stop()
+            
+            st.markdown(f"## 📤 Create {mode} Collection")
+            org = get_organization(st.session_state.org_id)
+            st.info(f"Creating for: **{org['org_name']}**")
+        else:
+            target_id = get_user_id()
+            mode = "Personal"
+            st.markdown("## 📤 Upload Documents for RAG")
         
         collection_name = st.text_input("Collection Name:", value="")
         
@@ -770,7 +1511,7 @@ def main():
                             if has_local_files:
                                 # Local files - existing logic
                                 st.info("📁 Processing local files...")
-                                res = upload_local_files(get_user_id(), collection_name, uploaded_files)
+                                res = upload_local_files(target_id, collection_name, uploaded_files)
                                 if res:
                                     elapsed = time.time() - start_time
                                     st.success(f"✅ Collection created in {elapsed:.1f}s!")
@@ -814,7 +1555,7 @@ def main():
                                                 account_info="multi_account"
                                             )
                                         else:
-                                            result = create_knowledge_base(get_user_id(), collection_name, downloaded_files)
+                                            result = create_knowledge_base(target_id, collection_name, downloaded_files)
                                         
                                         if result["success"]:
                                             elapsed = time.time() - start_time 
@@ -868,17 +1609,40 @@ def main():
     # EDIT COLLECTION INTERFACE
     if st.session_state.get('show_edit', False):
         st.markdown("---")
-        st.markdown("## ✏️ Edit Collection")
+        # Determine target (org or personal)
+        if st.session_state.org_id:
+            if st.session_state.team_id:
+                target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+            elif st.session_state.org_role == "owner" and st.session_state.selected_team_id:
+                target_id = f"{st.session_state.org_id}/{st.session_state.selected_team_id}"
+            else:
+                target_id = None
+            mode = "Organization"
+            
+            # Permission check
+            if not check_permission(st.session_state.org_id, get_user_id(), "edit_collection"):
+                st.error("⛔ Only owner and team admins can upload to organization")
+                if st.button("Close", key="close_edit_error"):
+                    st.session_state['show_edit'] = False
+                    st.rerun()
+                st.stop()
+            
+            st.markdown(f"## ✏️ Edit {mode} Collection")
+            org = get_organization(st.session_state.org_id)
+            st.info(f"Editing: **{org['org_name']}** collection")
+        else:
+            target_id = get_user_id()
+            mode = "Personal"
+            st.markdown("## ✏️ Edit Collection")
         
-        user_id = get_user_id()
-        collections = get_user_collections(user_id)
+        collections = get_user_collections(target_id)
         
         if collections:
             collection_name = collections[0]
             
             # Get metadata
             try:
-                metadata_path = f"db_collection/{user_id}/{collection_name}/knowledge_base_metadata.json"
+                metadata_path = f"db_collection/{target_id}/{collection_name}/knowledge_base_metadata.json"
                 with open(metadata_path, 'r') as f:
                     metadata = json.load(f)
                 
@@ -896,7 +1660,7 @@ def main():
                             if st.button("🗑️", key=f"delete_{filename}"):
                                 with st.spinner(f"Deleting {filename}..."):
                                     from core.knowledge_base import delete_file
-                                    result = delete_file(user_id, collection_name, filename)
+                                    result = delete_file(target_id, collection_name, filename)
                                     
                                     if result["success"]:
                                         st.success(f"✅ Deleted {filename}")
@@ -939,7 +1703,7 @@ def main():
                         
                         try:
                             from core.knowledge_base import add_files
-                            result = add_files(user_id, collection_name, temp_paths)
+                            result = add_files(target_id, collection_name, temp_paths)
                             
                             if result["success"]:
                                 st.success(f"✅ Added {len(new_files)} files!")
@@ -1022,11 +1786,31 @@ def main():
                             if show_debug:
                                 st.warning(f"Background worker start error: {e}")
                                 
+                    # Determine query target based on role and team
+                    if st.session_state.org_id:
+                        # Organization mode
+                        if st.session_state.org_role == "owner":
+                            # Owner uses selected_team_id from dropdown
+                            if st.session_state.selected_team_id:
+                                query_target_id = f"{st.session_state.org_id}/{st.session_state.selected_team_id}"
+                            else:
+                                query_target_id = f"viewer_{st.session_state.org_id}_{get_user_id()}" # No team selected - RAG will fail gracefully
+                        elif st.session_state.team_id:
+                            # Team admin/member uses their assigned team
+                            query_target_id = f"{st.session_state.org_id}/{st.session_state.team_id}"
+                        else:
+                            # Viewer with no team
+                            query_target_id = f"viewer_{st.session_state.org_id}_{get_user_id()}" # RAG will fail gracefully
+                    else:
+                        # Personal mode
+                        query_target_id = get_user_id()
+
+                                
                     result = asyncio.run(process_query_real(
                         query, 
                         agents_result["optimized_agent"], 
                         style,
-                        user_id=get_user_id(),
+                        user_id=query_target_id,
                         chat_history=st.session_state.chat_history
                     ))
                     
