@@ -34,6 +34,7 @@ SCRAPING_CONFIRMATION_THRESHOLD = 3  # Ask confirmation for medium (3) and high 
 # Feature flags
 ENABLE_SCRAPING_GUIDANCE = True
 ENABLE_SCRAPING_CONFIRMATION = True  # Enable/disable confirmation flow
+ENABLE_SUPERSEDE_ON_NEW_QUERY = True  # Auto-cancel pending confirmations when user sends new non-confirmation query
 
 # Confirmation settings
 SCRAPING_CONFIRMATION_TTL = 300  # 5 minutes for pending confirmations
@@ -387,6 +388,52 @@ class RedisCacheManager:
         except Exception as e:
             logger.error(f"❌ Error deleting pending confirmation: {e}")
             return False
+    
+    async def cancel_all_pending_confirmations_for_user(self, user_id: str) -> int:
+        """
+        Cancel (delete) all pending confirmations for a specific user
+        Used when user sends a new non-confirmation query to prevent accidental resumption
+        
+        Args:
+            user_id: User ID
+        
+        Returns:
+            Number of pending confirmations cancelled
+        """
+        if not self.enabled or not self.redis_client:
+            return 0
+        
+        try:
+            # Scan for user's pending confirmations
+            pattern = f"pending_confirm:*"
+            cursor = 0
+            cancelled_count = 0
+            
+            while True:
+                cursor, keys = await self.redis_client.scan(cursor, match=pattern, count=100)
+                
+                for key in keys:
+                    cached_data = await self.redis_client.get(key)
+                    if cached_data:
+                        payload = json.loads(cached_data)
+                        if payload.get("user_id") == user_id:
+                            # Delete this pending confirmation
+                            token = payload.get("token")
+                            await self.redis_client.delete(key)
+                            logger.info(f"🔻 Superseded pending confirmation {token} for user {user_id}")
+                            cancelled_count += 1
+                
+                if cursor == 0:
+                    break
+            
+            if cancelled_count > 0:
+                logger.info(f"✅ Cancelled {cancelled_count} pending confirmation(s) for user {user_id}")
+            
+            return cancelled_count
+            
+        except Exception as e:
+            logger.error(f"❌ Error cancelling pending confirmations: {e}")
+            return 0
 
 class Config:
     """Dynamic configuration manager - fixed version"""

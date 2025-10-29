@@ -24,7 +24,8 @@ from .config import (
     RedisCacheManager,
     ENABLE_SCRAPING_CONFIRMATION,
     SCRAPING_CONFIRMATION_THRESHOLD,
-    ESTIMATED_TIME_PER_PAGE
+    ESTIMATED_TIME_PER_PAGE,
+    ENABLE_SUPERSEDE_ON_NEW_QUERY
 )
 
 config = MemoryConfig(
@@ -224,6 +225,12 @@ class OptimizedAgent:
                 else:
                     logger.info(f"⚠️ No pending confirmation found - treating as normal query")
                     # Fall through to normal processing
+            
+            # STEP 1.5: If NOT a confirmation reply and user has pending confirmations, cancel them
+            elif not confirmation_reply and user_id and ENABLE_SUPERSEDE_ON_NEW_QUERY:
+                cancelled_count = await self.cache_manager.cancel_all_pending_confirmations_for_user(user_id)
+                if cancelled_count > 0:
+                    logger.info(f"🔻 Auto-cancelled {cancelled_count} pending confirmation(s) - user sent new query: '{query[:50]}...'")
             
             # Check cache first
             cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
