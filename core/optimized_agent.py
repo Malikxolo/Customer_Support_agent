@@ -206,6 +206,25 @@ class OptimizedAgent:
                 
                 # Retrieve memories for context
                 memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                
+                # Detailed mem0 logging
+                logger.info(f"🧠 MEM0 SEARCH RESULTS (Pending Confirmation Path):")
+                logger.info(f"   Query: '{query[:50]}...'")
+                logger.info(f"   User ID: {user_id}")
+                logger.info(f"   Raw results type: {type(memory_results)}")
+                logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+                logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+                
+                # Log each individual memory
+                if isinstance(memory_results, dict) and 'results' in memory_results:
+                    for idx, item in enumerate(memory_results.get('results', [])):
+                        logger.info(f"   Memory {idx + 1}:")
+                        logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                        logger.info(f"      Score: {item.get('score', 'N/A')}")
+                        logger.info(f"      Metadata: {item.get('metadata', {})}")
+                else:
+                    logger.info(f"   ⚠️ No results or unexpected format")
+                
                 memories = "\n".join([
                     f"- {item['memory']}" 
                     for item in memory_results.get("results", []) 
@@ -283,6 +302,25 @@ class OptimizedAgent:
                 else:
                     # Retrieve memories
                     memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                    
+                    # Detailed mem0 logging
+                    logger.info(f"🧠 MEM0 SEARCH RESULTS (Normal Query Path):")
+                    logger.info(f"   Query: '{query[:50]}...'")
+                    logger.info(f"   User ID: {user_id}")
+                    logger.info(f"   Raw results type: {type(memory_results)}")
+                    logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+                    logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+                    
+                    # Log each individual memory
+                    if isinstance(memory_results, dict) and 'results' in memory_results:
+                        for idx, item in enumerate(memory_results.get('results', [])):
+                            logger.info(f"   Memory {idx + 1}:")
+                            logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                            logger.info(f"      Score: {item.get('score', 'N/A')}")
+                            logger.info(f"      Metadata: {item.get('metadata', {})}")
+                    else:
+                        logger.info(f"   ⚠️ No results or unexpected format")
+                    
                     memories = "\n".join([
                         f"- {item['memory']}" 
                         for item in memory_results.get("results", []) 
@@ -452,6 +490,25 @@ class OptimizedAgent:
             # Get memories for response generation if not cached
             if not cached_analysis:
                 memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                
+                # Detailed mem0 logging
+                logger.info(f"🧠 MEM0 SEARCH RESULTS (Response Generation Path):")
+                logger.info(f"   Query: '{query[:50]}...'")
+                logger.info(f"   User ID: {user_id}")
+                logger.info(f"   Raw results type: {type(memory_results)}")
+                logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+                logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+                
+                # Log each individual memory
+                if isinstance(memory_results, dict) and 'results' in memory_results:
+                    for idx, item in enumerate(memory_results.get('results', [])):
+                        logger.info(f"   Memory {idx + 1}:")
+                        logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                        logger.info(f"      Score: {item.get('score', 'N/A')}")
+                        logger.info(f"      Metadata: {item.get('metadata', {})}")
+                else:
+                    logger.info(f"   ⚠️ No results or unexpected format")
+                
                 memories = "\n".join([
                     f"- {item['memory']}" 
                     for item in memory_results.get("results", []) 
@@ -591,6 +648,25 @@ class OptimizedAgent:
         
         # Get memories for response generation
         memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+        
+        # Detailed mem0 logging
+        logger.info(f"🧠 MEM0 SEARCH RESULTS (Resume Confirmation Path):")
+        logger.info(f"   Query: '{query[:50]}...'")
+        logger.info(f"   User ID: {user_id}")
+        logger.info(f"   Raw results type: {type(memory_results)}")
+        logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+        logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+        
+        # Log each individual memory
+        if isinstance(memory_results, dict) and 'results' in memory_results:
+            for idx, item in enumerate(memory_results.get('results', [])):
+                logger.info(f"   Memory {idx + 1}:")
+                logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                logger.info(f"      Score: {item.get('score', 'N/A')}")
+                logger.info(f"      Metadata: {item.get('metadata', {})}")
+        else:
+            logger.info(f"   ⚠️ No results or unexpected format")
+        
         memories = "\n".join([
             f"- {item['memory']}" 
             for item in memory_results.get("results", []) 
