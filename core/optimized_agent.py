@@ -20,8 +20,7 @@ from mem0 import AsyncMemory
 from functools import partial
 from mem0.configs.base import MemoryConfig
 from .config import (
-    AddBackgroundTask, 
-    RedisCacheManager,
+    AddBackgroundTask,
     ENABLE_SCRAPING_CONFIRMATION,
     SCRAPING_CONFIRMATION_THRESHOLD,
     ESTIMATED_TIME_PER_PAGE,
@@ -30,6 +29,7 @@ from .config import (
     LLM_CONFIRMATION_CONFIDENCE_THRESHOLD,
     ENABLE_CONFIRMATION_REGEX_FALLBACK
 )
+from .redis_manager import RedisCacheManager
 
 config = MemoryConfig(
     graph_store={
@@ -436,38 +436,26 @@ class OptimizedAgent:
                     logger.warning(f"⚠️ Failed to store confirmation - proceeding without confirmation")
                     # Fall through to normal execution
             
-            # STEP 4: Check for cached tool results first
-            cached_tool_results = None
-            tools_cache_hit = False
+            # STEP 4: Execute tools (for normal/non-confirmation queries only)
+            # Note: For high-scrape queries, tool execution happens in _resume_with_confirmation()
+            # after user responds to confirmation prompt. This ensures cache is checked with
+            # the correct scraping level (HIGH if yes, LOW if no).
             
-            if tools_to_use:
-                cached_tool_results = await self.cache_manager.get_cached_tool_results(
-                    query, tools_to_use, user_id, scraping_guidance
-                )
-                if cached_tool_results:
-                    tools_cache_hit = True
-                    logger.info(f"🎯 USING CACHED TOOL RESULTS - Skipping tool execution")
+            tool_start = datetime.now()
+            tool_results = await self._execute_tools(
+                tools_to_use,
+                query,
+                analysis,
+                user_id
+            )
+            tool_time = (datetime.now() - tool_start).total_seconds()
+            logger.info(f" Tools executed in {tool_time:.2f}s")
             
-            if tools_cache_hit and cached_tool_results:
-                tool_results = cached_tool_results
-                tool_time = 0.0  # Cache hit = instant
-            else:
-                # Execute tools if needed (may include middleware LLM call for sequential)
-                tool_start = datetime.now()
-                tool_results = await self._execute_tools(
-                    tools_to_use,
-                    query,
-                    analysis,
-                    user_id
+            # Cache the tool results
+            if tool_results:
+                await self.cache_manager.cache_tool_results(
+                    query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
                 )
-                tool_time = (datetime.now() - tool_start).total_seconds()
-                logger.info(f" Tools executed in {tool_time:.2f}s")
-                
-                # Cache the tool results
-                if tool_results:
-                    await self.cache_manager.cache_tool_results(
-                        query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
-                    )
             
             if tool_results:
                 logger.info(f" TOOL RESULTS SUMMARY:")
@@ -546,7 +534,7 @@ class OptimizedAgent:
             
             logger.info(f" TOTAL PROCESSING TIME: {total_time:.2f}s ({llm_calls} LLM calls)")
             logger.info(f" ANALYSIS CACHE: {'HIT ✅' if cached_analysis else 'MISS ❌'}")
-            logger.info(f" TOOL CACHE: {'HIT ✅' if tools_cache_hit else 'MISS ❌'}")
+            # Note: Tool cache is checked inside _resume_with_confirmation() for high-scrape queries
             
             return {
                 "success": True,
@@ -557,7 +545,7 @@ class OptimizedAgent:
                 "execution_mode": execution_mode,
                 "business_opportunity": analysis.get('business_opportunity', {}),
                 "analysis_cache_hit": bool(cached_analysis),
-                "tools_cache_hit": tools_cache_hit,
+                "tools_cache_hit": False,  # Always False in normal flow; cache checked in confirmation flow
                 "processing_time": {
                     "analysis": analysis_time,
                     "tools": tool_time,
@@ -964,33 +952,26 @@ Perform ALL of the following analyses in ONE response:
    - "low" (1 page): Simple factual queries, quick lookups, single-source answers
      Examples: "what is capital of France", "current time", "definition of X"
    
-   - "medium" (3 pages): Comparison queries, multi-source verification, moderate depth
-     Examples: "compare iPhone vs Samsung", "best restaurants in Lucknow", "product reviews"
-   
    - "high" (5 pages): Complex research, comprehensive analysis, multi-faceted queries
      Examples: "analyze market trends", "competitive landscape", "in-depth technical comparison"
    
    DECISION RULES:
-   1. Query complexity: Simple fact → low, Comparison → medium, Research → high
-   2. Expected answer breadth: Single point → low, Multiple points → medium, Comprehensive → high
-   3. Verification needs: No verification → low, Cross-check → medium, Thorough validation → high
+   1. Query complexity: Simple fact → low, Research → high
+   2. Expected answer breadth: Single point → low, Comprehensive → high
+   3. Verification needs: No verification → low, Thorough validation → high
    
    For EACH web_search tool in tools_to_use, provide scraping guidance:
-   - Set `scraping_level`: "low", "medium", or "high"
-   - Set `scraping_count`: corresponding number (1, 3, or 5)
+   - Set `scraping_level`: "low", or "high"
+   - Set `scraping_count`: corresponding number (1 or 5)
    - Include brief `scraping_reason`: why this level is appropriate
    
    If NO web_search tool is used, omit scraping_guidance entirely.
    
-   IMPORTANT: For indexed tools (web_search_0, web_search_1), provide guidance for EACH:
+   IMPORTANT: For indexed tools (web_search_0), provide guidance for EACH:
    {{
      "scraping_guidance": {{
+       
        "web_search_0": {{
-         "scraping_level": "medium",
-         "scraping_count": 3,
-         "scraping_reason": "Comparison query requires multiple sources"
-       }},
-       "web_search_1": {{
          "scraping_level": "low",
          "scraping_count": 1,
          "scraping_reason": "Simple factual lookup"
@@ -1170,8 +1151,8 @@ Return ONLY valid JSON:
     }},
     "scraping_guidance": {{
         "web_search_0": {{
-            "scraping_level": "low|medium|high",
-            "scraping_count": 1|3|5,
+            "scraping_level": "low|high",
+            "scraping_count": 1|5,
             "scraping_reason": "why this level"
         }}
     }},
@@ -1316,8 +1297,8 @@ Return ONLY valid JSON:
                 scrape_count = None
                 if tool == 'web_search' and indexed_key in scraping_guidance:
                     guidance = scraping_guidance[indexed_key]
-                    scrape_count = guidance.get('scraping_count', 3)
-                    scraping_level = guidance.get('scraping_level', 'medium')
+                    scrape_count = guidance.get('scraping_count', 1)
+                    scraping_level = guidance.get('scraping_level', 'low')
                     logger.info(f"   📊 Scraping: {scraping_level} level ({scrape_count} pages)")
                     logger.info(f"   📋 Reason: {guidance.get('scraping_reason', 'N/A')}")
                 
@@ -1369,8 +1350,8 @@ Return ONLY valid JSON:
         first_tool_kwargs = {"query": first_query, "user_id": user_id}
         if first_tool_name == 'web_search' and first_tool_key in scraping_guidance:
             guidance = scraping_guidance[first_tool_key]
-            scrape_count = guidance.get('scraping_count', 3)
-            scraping_level = guidance.get('scraping_level', 'medium')
+            scrape_count = guidance.get('scraping_count', 1)
+            scraping_level = guidance.get('scraping_level', 'low')
             first_tool_kwargs["scrape_top"] = scrape_count
             logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
         
@@ -1409,8 +1390,8 @@ Return ONLY valid JSON:
             current_tool_kwargs = {"query": enhanced_query, "user_id": user_id}
             if current_tool_name == 'web_search' and current_tool_key in scraping_guidance:
                 guidance = scraping_guidance[current_tool_key]
-                scrape_count = guidance.get('scraping_count', 3)
-                scraping_level = guidance.get('scraping_level', 'medium')
+                scrape_count = guidance.get('scraping_count', 1)
+                scraping_level = guidance.get('scraping_level', 'low')
                 current_tool_kwargs["scrape_top"] = scrape_count
                 logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
             
@@ -1858,8 +1839,6 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
         asyncio.create_task(self.cache_manager.cache_tool_data(tool_results, final_formatted, ttl=7200))
         
         return final_formatted
-
-
     def _extract_recent_phrases(self, chat_history: List[Dict]) -> List[str]:
         """Extract recent phrases to avoid repetition"""
         if not chat_history:
