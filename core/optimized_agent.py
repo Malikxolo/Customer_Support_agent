@@ -1778,13 +1778,30 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
         for tool, result in tool_results.items():
             if isinstance(result, dict) and 'error' not in result:
                 # Handle RAG-style result
-                if 'success' in result and result['success']:
-                    if 'retrieved' in result:
-                        retrieved = result.get('retrieved', '')
-                        chunks = result.get('chunks', [])
+                if "success" in result and result["success"]:
+                    logger.info(f" Formatting result for tool: {result}")
+                    if "retrieved" in result:
+                        retrieved = result.get("retrieved", "")
+                        chunks = result.get("chunks", [])
                         formatted.append(f"{tool.upper()} RETRIEVED TEXT:\n{retrieved}\n")
+
                         if chunks:
-                            formatted.append(f"{tool.upper()} CHUNKS:\n" + "\n---\n".join(chunks))
+                            # Normalize chunks into readable strings
+                            formatted_chunks = []
+                            for c in chunks:
+                                if isinstance(c, str):
+                                    formatted_chunks.append(c)
+                                elif isinstance(c, dict):
+                                    doc = c.get("document", "")
+                                    filename = c.get("metadata", {}).get("filename", "unknown file")
+                                    distance = c.get("distance", None)
+                                    info_line = f"[{filename}] (distance={distance:.4f})" if distance is not None else f"[{filename}]"
+                                    formatted_chunks.append(f"{info_line}\n{doc}")
+                                else:
+                                    formatted_chunks.append(str(c))  # fallback for unexpected types
+
+                            formatted.append(f"{tool.upper()} CHUNKS:\n" + "\n---\n".join(formatted_chunks))
+
                     
                     # Handle web search-style results
                     elif 'results' in result and isinstance(result['results'], list):

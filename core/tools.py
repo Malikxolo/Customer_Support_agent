@@ -832,7 +832,7 @@ class RAGTool(BaseTool):
                 collection_name = "default_collection"
             
             # Query the user's collection
-            result = query_documents(org_id, collection_name, query, user_id, n_results=5)
+            result = await query_documents(org_id, collection_name, query, user_id, n_results=5)
             
             if result["success"]:
                 chunks_count = len(result["results"])
@@ -864,13 +864,16 @@ class RAGTool(BaseTool):
                     logger.warning("   No distance information available")
                 
                 # Log first chunk preview for debugging
+                documents = []
                 if result["results"]:
-                    first_chunk = result["results"][0][:100] + "..." if len(result["results"][0]) > 100 else result["results"][0]
-                    logger.debug(f"   First chunk preview: '{first_chunk}'")
+                    documents = [r["document"] for r in result["results"] if isinstance(r, dict) and "document" in r]
+                    first_chunk = documents[0][:200] + ("..." if len(documents[0]) > 200 else "")   
+                    logger.info(f"   First chunk preview: '{first_chunk}'")
+                    logger.info(f"   Total retrieved documents: {len(documents)}")
                 
                 return {
                     "success": True,
-                    "retrieved": "\n\n".join(result["results"]),
+                    "retrieved": "\n\n".join(documents),
                     "chunks": result["results"],
                     "query": query,
                     "chunks_count": chunks_count,
@@ -1085,6 +1088,7 @@ class ToolManager:
             result["tool_name"] = tool_name
             
             if result.get("success"):
+                
                 logger.info(f"✅ Tool '{tool_name}' executed successfully")
             else:
                 logger.warning(f"⚠️ Tool '{tool_name}' execution failed: {result.get('error')}")

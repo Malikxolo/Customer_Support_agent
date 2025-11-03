@@ -103,7 +103,10 @@ async def lifespan(app: FastAPI):
     org_manager = initialize_org_manager(mongo_client, database_name="knowledge_base")
     
     # Initialize Knowledge Base Manager
-    chroma_client = chromadb.Client()
+    chroma_client = chromadb.HttpClient(
+        host=os.getenv('CHROMA_HOST', 'http://localhost:8000'),
+        port=int(os.getenv('CHROMA_PORT', '8000'))
+    )
     kb_manager = initialize_kb_manager(
         chroma_client=chroma_client,
         mongo_client=mongo_client,

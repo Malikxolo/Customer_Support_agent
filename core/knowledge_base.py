@@ -405,28 +405,50 @@ class KnowledgeBaseManager:
             query_text: Query text
             user_id: User making the query
             n_results: Number of results to return
-            where: Optional metadata filters
+            where: Optional metadata filters (ChromaDB format)
         
         Returns:
-            {"success": bool, "results": List[Dict], "error": str}
+            {
+                "success": bool,
+                "results": List[Dict],
+                "query": str,
+                "count": int,
+                "error": str (if failed)
+            }
         """
         try:
+            logger.info(f"Query request - org_id: {org_id}, collection_name: {collection_name}, user_id: {user_id}, query: {query_text[:50]}...")
+            
             # Verify user is in organization
             org = await self.org_manager.get_organization(org_id)
             if not org:
+                logger.error(f"Organization not found: {org_id}")
                 return {"success": False, "error": "Organization not found"}
             
             if user_id not in org.get("members", {}):
+                logger.error(f"User {user_id} not in organization {org_id}")
                 return {"success": False, "error": "User not in organization"}
             
-            # Get collection metadata
+            # Get collection metadata from MongoDB
+            logger.info(f"Looking for collection in MongoDB: org_id={org_id}, collection_name={collection_name}")
             collection_meta = await asyncio.to_thread(
                 self.collections_metadata.find_one,
                 {"org_id": org_id, "collection_name": collection_name}
             )
             
             if not collection_meta:
-                return {"success": False, "error": "Collection not found"}
+                # List all collections for this org to help debug
+                all_collections = await asyncio.to_thread(
+                    lambda: list(self.collections_metadata.find({"org_id": org_id}))
+                )
+                collection_names = [col.get("collection_name") for col in all_collections]
+                logger.error(f"Collection '{collection_name}' not found in org '{org_id}'. Available collections: {collection_names}")
+                return {
+                    "success": False, 
+                    "error": f"Collection '{collection_name}' not found. Available collections: {collection_names}"
+                }
+            
+            logger.info(f"Found collection metadata: {collection_meta.get('collection_name')} -> ChromaDB: {collection_meta.get('chroma_collection_name')}")
             
             # Verify team access
             team_id = collection_meta.get("team_id")
@@ -442,24 +464,52 @@ class KnowledgeBaseManager:
                 )
                 
                 if not can_access:
+                    logger.error(f"Access denied: user_team={user_team_id}, collection_team={team_id}, user_role={user_role}")
                     return {"success": False, "error": "Access denied to this team's collection"}
             
             # Get ChromaDB collection
             chroma_collection_name = collection_meta["chroma_collection_name"]
-            chroma_collection = await asyncio.to_thread(
-                self.chroma_client.get_collection,
-                name=chroma_collection_name,
-                embedding_function=self.embedding_function
-            )
+            logger.info(f"Attempting to get ChromaDB collection: {chroma_collection_name}")
+            
+            try:
+                chroma_collection = await asyncio.to_thread(
+                    self.chroma_client.get_collection,
+                    name=chroma_collection_name,
+                    embedding_function=self.embedding_function
+                )
+                logger.info(f"Successfully retrieved ChromaDB collection: {chroma_collection.name}")
+            except Exception as e:
+                # List all ChromaDB collections for debugging
+                available_chroma_collections = [col.name for col in self.chroma_client.list_collections()]
+                logger.error(f"Failed to get ChromaDB collection '{chroma_collection_name}'. Available: {available_chroma_collections}")
+                return {
+                    "success": False,
+                    "error": f"ChromaDB collection '{chroma_collection_name}' not found. Error: {str(e)}"
+                }
+            
+            # Fix: Convert empty dict to None for ChromaDB
+            # ChromaDB doesn't accept empty dictionaries as where filters
+            if where is not None and (not where or where == {}):
+                logger.info("Converting empty where filter to None")
+                where = None
+            
+            logger.info(f"Executing query with where filter: {where}, n_results: {n_results}")
             
             # Perform query
-            results = await asyncio.to_thread(
-                chroma_collection.query,
-                query_texts=[query_text],
-                n_results=n_results,
-                where=where,
-                include=["documents", "metadatas", "distances"]
-            )
+            try:
+                results = await asyncio.to_thread(
+                    chroma_collection.query,
+                    query_texts=[query_text],
+                    n_results=n_results,
+                    where=where,
+                    include=["documents", "metadatas", "distances"]
+                )
+            except Exception as e:
+                logger.error(f"ChromaDB query failed: {str(e)}")
+                return {
+                    "success": False,
+                    "error": f"Query failed: {str(e)}"
+                }
             
             # Format results
             formatted_results = []
@@ -472,6 +522,8 @@ class KnowledgeBaseManager:
                         "distance": results["distances"][0][i]
                     })
             
+            logger.info(f"Query completed successfully. Found {len(formatted_results)} results")
+            
             return {
                 "success": True,
                 "results": formatted_results,
@@ -480,7 +532,8 @@ class KnowledgeBaseManager:
             }
             
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            logger.error(f"Unexpected error in query_documents: {str(e)}", exc_info=True)
+            return {"success": False, "error": f"Unexpected error: {str(e)}"}
     
     async def delete_documents(
         self,
