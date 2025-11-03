@@ -20,8 +20,7 @@ from mem0 import AsyncMemory
 from functools import partial
 from mem0.configs.base import MemoryConfig
 from .config import (
-    AddBackgroundTask, 
-    RedisCacheManager,
+    AddBackgroundTask,
     ENABLE_SCRAPING_CONFIRMATION,
     SCRAPING_CONFIRMATION_THRESHOLD,
     ESTIMATED_TIME_PER_PAGE,
@@ -30,6 +29,7 @@ from .config import (
     LLM_CONFIRMATION_CONFIDENCE_THRESHOLD,
     ENABLE_CONFIRMATION_REGEX_FALLBACK
 )
+from .redis_manager import RedisCacheManager
 
 config = MemoryConfig(
     graph_store={
@@ -436,38 +436,26 @@ class OptimizedAgent:
                     logger.warning(f"⚠️ Failed to store confirmation - proceeding without confirmation")
                     # Fall through to normal execution
             
-            # STEP 4: Check for cached tool results first
-            cached_tool_results = None
-            tools_cache_hit = False
+            # STEP 4: Execute tools (for normal/non-confirmation queries only)
+            # Note: For high-scrape queries, tool execution happens in _resume_with_confirmation()
+            # after user responds to confirmation prompt. This ensures cache is checked with
+            # the correct scraping level (HIGH if yes, LOW if no).
             
-            if tools_to_use:
-                cached_tool_results = await self.cache_manager.get_cached_tool_results(
-                    query, tools_to_use, user_id, scraping_guidance
-                )
-                if cached_tool_results:
-                    tools_cache_hit = True
-                    logger.info(f"🎯 USING CACHED TOOL RESULTS - Skipping tool execution")
+            tool_start = datetime.now()
+            tool_results = await self._execute_tools(
+                tools_to_use,
+                query,
+                analysis,
+                user_id
+            )
+            tool_time = (datetime.now() - tool_start).total_seconds()
+            logger.info(f" Tools executed in {tool_time:.2f}s")
             
-            if tools_cache_hit and cached_tool_results:
-                tool_results = cached_tool_results
-                tool_time = 0.0  # Cache hit = instant
-            else:
-                # Execute tools if needed (may include middleware LLM call for sequential)
-                tool_start = datetime.now()
-                tool_results = await self._execute_tools(
-                    tools_to_use,
-                    query,
-                    analysis,
-                    user_id
+            # Cache the tool results
+            if tool_results:
+                await self.cache_manager.cache_tool_results(
+                    query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
                 )
-                tool_time = (datetime.now() - tool_start).total_seconds()
-                logger.info(f" Tools executed in {tool_time:.2f}s")
-                
-                # Cache the tool results
-                if tool_results:
-                    await self.cache_manager.cache_tool_results(
-                        query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
-                    )
             
             if tool_results:
                 logger.info(f" TOOL RESULTS SUMMARY:")
@@ -546,7 +534,7 @@ class OptimizedAgent:
             
             logger.info(f" TOTAL PROCESSING TIME: {total_time:.2f}s ({llm_calls} LLM calls)")
             logger.info(f" ANALYSIS CACHE: {'HIT ✅' if cached_analysis else 'MISS ❌'}")
-            logger.info(f" TOOL CACHE: {'HIT ✅' if tools_cache_hit else 'MISS ❌'}")
+            # Note: Tool cache is checked inside _resume_with_confirmation() for high-scrape queries
             
             return {
                 "success": True,
@@ -557,7 +545,7 @@ class OptimizedAgent:
                 "execution_mode": execution_mode,
                 "business_opportunity": analysis.get('business_opportunity', {}),
                 "analysis_cache_hit": bool(cached_analysis),
-                "tools_cache_hit": tools_cache_hit,
+                "tools_cache_hit": False,  # Always False in normal flow; cache checked in confirmation flow
                 "processing_time": {
                     "analysis": analysis_time,
                     "tools": tool_time,
