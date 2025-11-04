@@ -24,7 +24,7 @@ SCRAPING_LEVELS = {
 }
 
 # Threshold for scraping that requires user confirmation (pages)
-SCRAPING_CONFIRMATION_THRESHOLD = 3  # Ask confirmation for medium (3) and high (5) scraping
+SCRAPING_CONFIRMATION_THRESHOLD = 5  # Ask confirmation for medium (3) and high (5) scraping
 
 # Feature flags
 ENABLE_SCRAPING_GUIDANCE = True
