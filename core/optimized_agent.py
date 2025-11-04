@@ -919,19 +919,22 @@ Perform ALL of the following analyses in ONE response:
 
    For EACH sub-task identified in step 1, select the most appropriate tool:
    
-   RAG SELECTION (STRICT RULE):
-   Select `rag` for a sub-task if EITHER:
-   1. The sub-task is directly ABOUT Mochan-D (mentions "Mochan-D", "our/your product", "this chatbot", etc.)
-   2. OR business_opportunity.detected = true for that sub-task
-
    GENERAL TOOL SELECTION:
    - `web_search`: For current information, prices, comparisons, weather, news, etc.
    - `calculator`: For mathematical calculations, statistical operations
    
+    AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
+    Select `rag` if ANY of:
+    1. Any sub-task is directly ABOUT Mochan-D
+    2. OR business_opportunity.detected = true
+    3. OR web_search is selected for ANY sub-task
+    
+    If rag should be added, add ONE `rag` to tools_to_use
+ 
    IMPORTANT: The `tools_to_use` array should contain one tool for each sub-task.
-   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search"]
-   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator"]
-   
+   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search", "rag"]
+   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator", "rag"]
+
    Use NO tools for:
    - Greetings, casual chat
    - General knowledge questions that don't require current information
@@ -1610,6 +1613,8 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
 
         Build your response using the tool data as your source of truth
         
+        TASK: When the user's query is an explicit action (summarize, extract, analyze, compare), DO THAT TASK using the available data. Don't ask for clarification on what to do - do it naturally.
+        
         AVAILABLE DATA TO USE NATURALLY:
         {tool_data}
 
@@ -1691,7 +1696,7 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
                 messages,
                 temperature=0.4,
                 max_tokens=4000,
-                system_prompt="You are Mochand Dost - conversational AI. If business opportunity exists, naturally pitch Mochan-D. Always natural conversation - NEVER JSON/analysis/structured data. Warm and helpful."
+                system_prompt="You are Mochand Dost. Answer the user's query using the provided data. Don't ask for clarification if data is given. Be warm, natural, conversational - NEVER JSON/structured data."
             )
             
             # LOG: Raw response from Heart LLM
