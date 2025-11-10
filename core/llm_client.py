@@ -155,7 +155,46 @@ class LLMClient:
                 logger.error(f"❌ 🤖 JSON parse error: {response_text[:100]}...")
                 raise Exception(f"Invalid JSON from {self.config.provider}: '{response_text[:200]}...' Error: {e}")
             
-            return result["choices"][0]["message"]["content"]
+            # Extract content - handle thinking models that use 'reasoning' field
+            choice = result["choices"][0]
+            message = choice["message"]
+            content = message.get("content", "")
+            
+            # Thinking models (like Qwen) put reasoning in separate field
+            if (content is None or content == "") and "reasoning" in message:
+                reasoning = message["reasoning"]
+                logger.info(f"🧠 Thinking model detected - using 'reasoning' field")
+                
+                # Show the FULL reasoning/thinking process
+                print(f"\n{'='*80}")
+                print(f"💭 FULL THINKING PROCESS (RAW):")
+                print(f"{'='*80}")
+                print(reasoning)
+                print(f"{'='*80}\n")
+                
+                content = reasoning
+            elif "reasoning" in message and message.get("content"):
+                # Both fields exist - show reasoning separately
+                reasoning = message["reasoning"]
+                logger.info(f"🧠 Thinking model with both fields")
+                
+                print(f"\n{'='*80}")
+                print(f"💭 FULL THINKING PROCESS (RAW):")
+                print(f"{'='*80}")
+                print(reasoning)
+                print(f"{'='*80}\n")
+            
+            # Check if we hit token limit
+            if choice.get("finish_reason") == "length":
+                logger.warning(f"⚠️ Response truncated due to token limit!")
+                logger.warning(f"   Current max_tokens: {max_tokens}")
+                logger.warning(f"   Consider increasing max_tokens in config")
+            
+            if not content:
+                logger.error(f"❌ No content found. Message keys: {message.keys()}")
+                raise Exception(f"Empty content in response")
+            
+            return content
     
     def get_model_info(self) -> Dict[str, str]:
         """Get model information"""

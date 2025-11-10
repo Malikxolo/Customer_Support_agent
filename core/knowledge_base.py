@@ -15,7 +15,7 @@ import hashlib
 import logging
 from os import getenv, path
 from fastapi import UploadFile
-from langchain.schema import Document
+from langchain_core.documents import Document
 from redis.asyncio import Redis
 import tempfile
 import shutil

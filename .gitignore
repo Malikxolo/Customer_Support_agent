@@ -5,6 +5,9 @@
 .env.local
 *.key
 
+# Ignore Python virtual environment
+vo/
+
 # Python
 __pycache__/
 *.py[cod]

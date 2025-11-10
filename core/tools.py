@@ -19,7 +19,7 @@ from .exceptions import ToolExecutionError
 from .quota_manager import QuotaManager
 from .llm_client import LLMClient
 from .knowledge_base import query_documents, get_collection_cache, get_org_cache
-from .web_search_agent import search_perplexity
+from .web_search_agent import search_perplexity, search_llmlayer
 import ast
 from redis.asyncio import Redis
 
@@ -219,6 +219,8 @@ class WebSearchTool(BaseTool):
         serper_key: str = None,
         valueserp_key: str = None,
         perplexity_key: str = None,
+        llmlayer_key: str = None,
+        llmlayer_url: str = None,
         jina_api_key: str = None
     ):
         super().__init__(
@@ -234,6 +236,8 @@ class WebSearchTool(BaseTool):
         self.serper_key = serper_key or os.getenv("SERPER_API_KEY")
         self.valueserp_key = valueserp_key or os.getenv("VALUESERP_API_KEY")
         self.perplexity_key = perplexity_key or os.getenv("PERPLEXITY_API_KEY")
+        self.llmlayer_key = llmlayer_key or os.getenv("LLMLAYER_API_KEY")
+        self.llmlayer_url = llmlayer_url or os.getenv("LLMLAYER_API_URL", "https://api.llmlayer.dev/api/v2/answer")
         self.jina_api_key = jina_api_key or os.getenv("JINA_API_KEY")
         
         self.provider = provider
@@ -245,6 +249,8 @@ class WebSearchTool(BaseTool):
         # Build available providers list (priority order)
         self.available_providers = []
         
+        if self.llmlayer_key:
+            self.available_providers.append("llmlayer")
         if self.google_cse_key and self.google_cse_id:
             self.available_providers.append("google_cse")
         if self.brave_key:
@@ -260,6 +266,8 @@ class WebSearchTool(BaseTool):
         
         # Statistics
         self.stats = {
+            "llmlayer_success": 0,
+            "llmlayer_failed": 0,
             "google_cse_success": 0,
             "google_cse_failed": 0,
             "brave_success": 0,
@@ -335,7 +343,9 @@ class WebSearchTool(BaseTool):
                 logger.info(f"   🔄 Using {provider.upper()}...")
                 
                 # Execute search based on provider
-                if provider == "google_cse":
+                if provider == "llmlayer":
+                    result = await self._llmlayer_search(query)
+                elif provider == "google_cse":
                     result = await self._google_cse_search(query, num_results, scrape_top)
                 elif provider == "brave":
                     result = await self._brave_search(query, num_results, scrape_top)
@@ -698,6 +708,36 @@ class WebSearchTool(BaseTool):
         except Exception as e:
             raise ToolExecutionError(f"Perplexity search failed: {str(e)}")
     
+    async def _llmlayer_search(self, query: str) -> Dict[str, Any]:
+        """LLMLayer Search (returns pre-formatted answer, no scraping needed)"""
+        
+        try:
+            from .web_search_agent import search_llmlayer
+            
+            logger.info(f"   🌐 Using LLMLayer...")
+            
+            response = await search_llmlayer(query, self.llmlayer_key, self.llmlayer_url)
+            
+            results = [{
+                "title": "LLMLayer Search Results",
+                "snippet": response,
+                "link": "",
+                "position": 1
+            }]
+            
+            return {
+                "success": True,
+                "query": query,
+                "results": results,
+                "total_results": 1,
+                "scraped_count": 0,
+                "provider": "llmlayer",
+                "llm_response": response  # Pre-formatted response
+            }
+            
+        except Exception as e:
+            raise ToolExecutionError(f"LLMLayer search failed: {str(e)}")
+    
     # ==================== SCRAPING UTILITIES ====================
     
     async def _scrape_results(self, results: List[Dict], scrape_top: int) -> int:
@@ -738,7 +778,7 @@ class WebSearchTool(BaseTool):
                 logger.debug(f"      ⚠️ [{idx+1}] {scraped}")
                 results[idx]["scraped_content"] = scraped
             else:
-                results[idx]["scraped_content"] = scraped[:3000]  # Limit to 3000 chars
+                results[idx]["scraped_content"] = scraped[:20000]  # Limit to 20000 chars
                 scraped_count += 1
                 self.stats["total_scraped"] += 1
                 logger.debug(f"      ✅ [{idx+1}] Scraped {len(scraped)} chars")
@@ -784,7 +824,7 @@ class WebSearchTool(BaseTool):
         total_attempts = self.stats["total_searches"]
         total_success = sum(
             self.stats[f"{p}_success"] 
-            for p in ["google_cse", "brave", "scrapingdog", "serper", "valueserp", "perplexity"]
+            for p in ["llmlayer", "google_cse", "brave", "scrapingdog", "serper", "valueserp", "perplexity"]
         )
         
         return {
@@ -986,11 +1026,17 @@ class ToolManager:
         # Perplexity
         perplexity_key = os.getenv("PERPLEXITY_API_KEY") or web_config.get("perplexity_key")
         
+        # LLMLayer
+        llmlayer_key = os.getenv("LLMLAYER_API_KEY") or web_config.get("llmlayer_key")
+        llmlayer_url = os.getenv("LLMLAYER_API_URL") or web_config.get("llmlayer_url", "https://api.llmlayer.dev/api/v2/answer")
+        
         # Jina Reader (for scraping)
         jina_api_key = os.getenv("JINA_API_KEY") or web_config.get("jina_key")
         
         # Count available providers
         available_providers = []
+        if llmlayer_key:
+            available_providers.append("llmlayer")
         if google_cse_key and google_cse_id:
             available_providers.append("google_cse")
         if brave_key:
@@ -1007,7 +1053,7 @@ class ToolManager:
         # Check if we have at least one provider
         if not available_providers:
             logger.warning("⚠️ Web search enabled but no API keys configured")
-            logger.info("💡 Add API keys for: Google CSE, Brave, ScrapingDog, Serper, ValueSerp, or Perplexity")
+            logger.info("💡 Add API keys for: LLMLayer, Google CSE, Brave, ScrapingDog, Serper, ValueSerp, or Perplexity")
             return
         
         # Determine provider mode
@@ -1031,6 +1077,8 @@ class ToolManager:
                 serper_key=serper_key,
                 valueserp_key=valueserp_key,
                 perplexity_key=perplexity_key,
+                llmlayer_key=llmlayer_key,
+                llmlayer_url=llmlayer_url,
                 jina_api_key=jina_api_key
             )
             

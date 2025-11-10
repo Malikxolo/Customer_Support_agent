@@ -99,6 +99,60 @@ async def search_perplexity(query: str, model: str = 'perplexity/sonar') -> str:
         # Return a structured error response instead of failing
         return f"Search failed: {str(e)}. Please check your OPENROUTER_API_KEY and try again."
 
+async def search_llmlayer(query: str, api_key: str, api_url: str) -> str:
+    """
+    Search using LLMLayer API - returns pre-formatted answer
+    
+    Args:
+        query: Search query (can be comma-separated for multiple queries)
+        api_key: LLMLayer API key
+        api_url: LLMLayer API endpoint
+    
+    Returns:
+        Pre-formatted text response
+    """
+    try:
+        logger.info(f"🌐 LLMLayer search for query: {query[:100]}...")
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        # Answer API payload - query breaking + search + scrape + summarize
+        payload = {
+            "query": query,
+            "model": "groq/openai-gpt-oss-20b",
+            "return_sources": True,
+            "location": "in"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                api_url, 
+                headers=headers, 
+                json=payload, 
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"LLMLayer API error {response.status}: {error_text[:200]}")
+                
+                data = await response.json()
+                answer = data.get("answer", "")
+                
+                if not answer:
+                    raise Exception("No answer received from LLMLayer")
+                
+                logger.info(f"✅ LLMLayer search completed: {len(answer)} characters")
+                return answer
+                
+    except Exception as e:
+        error_msg = f"LLMLayer search failed: {str(e)}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+
 async def test_search_functionality():
     """Test function to verify search functionality"""
     try:

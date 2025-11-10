@@ -1,7 +1,6 @@
 """
 Configuration system for Brain-Heart Deep Research System
 FIXED VERSION - Proper web model handling
-WITH SCRAPING GUIDANCE CONFIGURATION
 """
 
 import os
@@ -13,30 +12,6 @@ load_dotenv(find_dotenv())
 from typing import Callable, Coroutine, Tuple, Any
 
 logger = logging.getLogger(__name__)
-
-# ==================== SCRAPING GUIDANCE CONFIGURATION ====================
-
-# Map scraping levels to actual counts
-SCRAPING_LEVELS = {
-    "low": 1,      # Scrape top 1 result
-    "medium": 3,   # Scrape top 3 results
-    "high": 5      # Scrape top 5 results
-}
-
-# Threshold for scraping that requires user confirmation (pages)
-SCRAPING_CONFIRMATION_THRESHOLD = 5  # Ask confirmation for medium (3) and high (5) scraping
-
-# Feature flags
-ENABLE_SCRAPING_GUIDANCE = True
-ENABLE_SCRAPING_CONFIRMATION = True  # Enable/disable confirmation flow
-ENABLE_SUPERSEDE_ON_NEW_QUERY = True  # Auto-cancel pending confirmations when user sends new non-confirmation query
-ENABLE_LLM_CONFIRMATION_DETECTION = True  # Use LLM for semantic confirmation intent detection
-ENABLE_CONFIRMATION_REGEX_FALLBACK = True  # Use regex fallback when LLM confidence is low
-
-# Confirmation settings
-SCRAPING_CONFIRMATION_TTL = 300  # 5 minutes for pending confirmations
-ESTIMATED_TIME_PER_PAGE = 5  # Seconds per page scraped (approximate)
-LLM_CONFIRMATION_CONFIDENCE_THRESHOLD = 70  # Minimum confidence to trust LLM intent detection
 
 @dataclass
 class AddBackgroundTask:
@@ -51,7 +26,7 @@ class LLMConfig:
     model: str
     api_key: str
     max_tokens: int = 4000
-    timeout: int = 30
+    timeout: int = 120  # Thinking models need 60-120s for complex reasoning
     base_url: Optional[str] = None
 
 
@@ -161,11 +136,19 @@ class Config:
         valueserp_key = os.getenv('VALUESERP_API_KEY')
         openrouter_key = os.getenv('OPENROUTER_API_KEY')
         jina_key = os.getenv('JINA_API_KEY')
+        
+        # LLMLayer configuration
+        llmlayer_enabled = os.getenv('LLMLAYER_ENABLED', 'false').lower() == 'true'
+        llmlayer_key = os.getenv('LLMLAYER_API_KEY')
+        llmlayer_url = os.getenv('LLMLAYER_API_URL', 'https://api.llmlayer.dev/api/v2/answer')
+        
         print(f"🔍 DEBUG: JINA_API_KEY from env: {jina_key[:20] if jina_key else '❌ NOT FOUND IN ENV!'}")
+        print(f"🌐 DEBUG: LLMLAYER_ENABLED: {llmlayer_enabled}")
+        print(f"🌐 DEBUG: LLMLAYER_API_KEY: {llmlayer_key[:20] if llmlayer_key else '❌ NOT FOUND!'}")
 
         
         # Web search is enabled if we have OpenRouter (for Perplexity) or search API keys
-        web_search_enabled = bool(openrouter_key or scrapingdog_key or valueserp_key)
+        web_search_enabled = bool(openrouter_key or scrapingdog_key or valueserp_key or llmlayer_key)
         
         tools = {
             'calculator': {
@@ -178,6 +161,9 @@ class Config:
                 'web_model': web_model if use_premium_search else None,
                 'primary_key': scrapingdog_key or valueserp_key,  # For non-Perplexity providers
                 'jina_key': jina_key,
+                'llmlayer_enabled': llmlayer_enabled,
+                'llmlayer_key': llmlayer_key,
+                'llmlayer_url': llmlayer_url,
                 'description': f'Internet search using {"Perplexity " + web_model if use_premium_search else "ScrapingDog/ValueSerp"}',
                 'model_info': {
                     'selected_model': web_model,

@@ -3,7 +3,6 @@ Optimized Single-Pass Agent System
 Combines semantic analysis, tool execution, and response generation in minimal LLM calls
 Now supports sequential tool execution with middleware for dependent tools
 WITH REDIS CACHING for queries and formatted tool data
-WITH SCRAPING CONFIRMATION FLOW for user consent on intensive scraping
 """
 
 import json
@@ -11,6 +10,7 @@ import logging
 import asyncio
 import uuid
 import re
+import os
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dotenv import load_dotenv
@@ -19,16 +19,7 @@ from os import getenv
 from mem0 import AsyncMemory
 from functools import partial
 from mem0.configs.base import MemoryConfig
-from .config import (
-    AddBackgroundTask,
-    ENABLE_SCRAPING_CONFIRMATION,
-    SCRAPING_CONFIRMATION_THRESHOLD,
-    ESTIMATED_TIME_PER_PAGE,
-    ENABLE_SUPERSEDE_ON_NEW_QUERY,
-    ENABLE_LLM_CONFIRMATION_DETECTION,
-    LLM_CONFIRMATION_CONFIDENCE_THRESHOLD,
-    ENABLE_CONFIRMATION_REGEX_FALLBACK
-)
+from .config import AddBackgroundTask
 from .redis_manager import RedisCacheManager
 
 config = MemoryConfig(
@@ -101,84 +92,9 @@ class OptimizedAgent:
         
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
         logger.info(f"Redis caching: {'ENABLED ✅' if self.cache_manager.enabled else 'DISABLED ⚠️'}")
-        logger.info(f"Scraping confirmation: {'ENABLED ✅' if ENABLE_SCRAPING_CONFIRMATION else 'DISABLED ⚠️'}")
-    
-    def _is_confirmation_reply(self, query: str) -> Optional[str]:
-        """
-        Detect if query is a yes/no confirmation reply
-        
-        Returns:
-            'yes', 'no', or None if not a confirmation
-        """
-        query_lower = query.lower().strip()
-        
-        # Yes patterns
-        yes_patterns = [
-            r'^yes$', r'^yeah$', r'^yep$', r'^yup$', r'^sure$', 
-            r'^ok$', r'^okay$', r'^continue$', r'^proceed$', r'^go ahead$',
-            r'^y$', r'^hai$', r'^han$', r'^haan$'  # Hindi: yes
-        ]
-        
-        # No patterns
-        no_patterns = [
-            r'^no$', r'^nah$', r'^nope$', r'^cancel$', r'^stop$',
-            r'^n$', r'^nahi$', r'^nai$', r'^mat karo$'  # Hindi: no
-        ]
-        
-        for pattern in yes_patterns:
-            if re.match(pattern, query_lower):
-                return 'yes'
-        
-        for pattern in no_patterns:
-            if re.match(pattern, query_lower):
-                return 'no'
-        
-        return None
-    
-    def _estimate_scraping_time(self, scraping_guidance: Dict) -> int:
-        """
-        Estimate total scraping time in seconds
-        
-        Args:
-            scraping_guidance: Dict of tool -> {scraping_count, ...}
-        
-        Returns:
-            Estimated time in seconds
-        """
-        total_pages = 0
-        for tool_key, guidance in scraping_guidance.items():
-            if 'web_search' in tool_key:
-                total_pages += guidance.get('scraping_count', 0)
-        
-        # Add base time for search + LLM processing
-        base_time = 5
-        scraping_time = total_pages * ESTIMATED_TIME_PER_PAGE
-        
-        return base_time + scraping_time
-    
-    def _needs_confirmation(self, scraping_guidance: Dict) -> bool:
-        """
-        Check if any scraping guidance requires user confirmation
-        
-        Args:
-            scraping_guidance: Dict of tool -> {scraping_count, ...}
-        
-        Returns:
-            True if confirmation needed
-        """
-        if not ENABLE_SCRAPING_CONFIRMATION:
-            return False
-        
-        for tool_key, guidance in scraping_guidance.items():
-            if 'web_search' in tool_key:
-                scraping_count = guidance.get('scraping_count', 0)
-                if scraping_count >= SCRAPING_CONFIRMATION_THRESHOLD:
-                    return True
-        
-        return False
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None, mode:str = None) -> Dict[str, Any]:
-        """Process query with minimal LLM calls, Redis caching, and scraping confirmation"""
+        """Process query with minimal LLM calls and Redis caching"""
         self._start_worker_if_needed()
         logger.info(f" PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
@@ -195,20 +111,19 @@ class OptimizedAgent:
         analysis_time = 0.0
         
         try:
-            # STEP 1: Check if pending confirmation exists for this user
-            pending = None
-            if user_id and ENABLE_SCRAPING_CONFIRMATION:
-                pending = await self.cache_manager.get_pending_confirmation_for_user(user_id)
+            # STEP 1: Check cache or analyze
+            cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
             
-            # STEP 2: Determine if this is a confirmation reply using LLM (if pending exists)
-            if pending and ENABLE_LLM_CONFIRMATION_DETECTION:
-                logger.info(f"⏳ Pending confirmation found - analyzing intent with LLM")
-                
-                # Retrieve memories for context
+            if cached_analysis:
+                logger.info(f"🎯 USING CACHED ANALYSIS - Skipping Brain LLM call")
+                analysis = cached_analysis
+                analysis_time = 0.0  # Cache hit = instant
+            else:
+                # Retrieve memories
                 memory_results = await self.memory.search(query, user_id=user_id, limit=5)
                 
                 # Detailed mem0 logging
-                logger.info(f"🧠 MEM0 SEARCH RESULTS (Pending Confirmation Path):")
+                logger.info(f"🧠 MEM0 SEARCH RESULTS:")
                 logger.info(f"   Query: '{query[:50]}...'")
                 logger.info(f"   User ID: {user_id}")
                 logger.info(f"   Raw results type: {type(memory_results)}")
@@ -230,117 +145,27 @@ class OptimizedAgent:
                     for item in memory_results.get("results", []) 
                     if item.get("memory")
                 ]) or "No previous context."
-                
-                # Call Brain LLM with pending confirmation context
-                analysis = await self._comprehensive_analysis(
-                    query=query,
-                    chat_history=chat_history,
-                    memories=memories,
-                    pending_confirmation=pending
-                )
-                
-                # Extract confirmation response from LLM
-                confirmation_response = analysis.get('confirmation_response', {})
-                has_pending = confirmation_response.get('has_pending', False)
-                user_intent = confirmation_response.get('user_intent', 'new_query')
-                confidence = confirmation_response.get('confidence', 0)
-                reasoning = confirmation_response.get('reasoning', 'No reasoning provided')
-                
-                logger.info(f"🎯 LLM Confirmation Analysis:")
-                logger.info(f"   Has Pending: {has_pending}")
-                logger.info(f"   User Intent: {user_intent}")
-                logger.info(f"   Confidence: {confidence}%")
-                logger.info(f"   Reasoning: {reasoning}")
-                
-                # Route based on LLM semantic analysis
-                if has_pending and user_intent == 'approve':
-                    # User approved - proceed with full scraping
-                    logger.info(f"✅ User approved (confidence: {confidence}%) - proceeding with full scraping")
-                    token = pending.get('token')
-                    await self.cache_manager.delete_pending_confirmation(token)
-                    
-                    return await self._resume_with_confirmation(
-                        pending=pending,
-                        user_decision='yes',
-                        start_time=start_time
-                    )
-                
-                elif has_pending and user_intent == 'decline':
-                    # User declined - downgrade scraping
-                    logger.info(f"� LLM detected decline (confidence: {confidence}%) - downgrading to minimal scraping")
-                    token = pending.get('token')
-                    await self.cache_manager.delete_pending_confirmation(token)
-                    
-                    return await self._resume_with_confirmation(
-                        pending=pending,
-                        user_decision='no',
-                        start_time=start_time
-                    )
-                
-                elif user_intent == 'new_query' or user_intent == 'ambiguous':
-                    # User changed topic or intent unclear - cancel pending and process new query
-                    logger.info(f"🔄 User intent: {user_intent} (confidence: {confidence}%) - cancelling pending and processing as new query")
-                    await self.cache_manager.cancel_all_pending_confirmations_for_user(user_id)
-                    # Fall through to normal processing with existing analysis
-                
-                # If we reached here, we have analysis from LLM - use it
-                logger.info(f"📊 Using LLM analysis from confirmation check")
-                analysis_time = 0.0  # Already analyzed above
-                
-            else:
-                # No pending confirmation - proceed normally
-                analysis = None
-            
-            # STEP 3: If no analysis yet (no pending or didn't use LLM path), check cache or analyze
-            if analysis is None:
-                cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
-                
-                if cached_analysis:
-                    logger.info(f"🎯 USING CACHED ANALYSIS - Skipping Brain LLM call")
-                    analysis = cached_analysis
-                    analysis_time = 0.0  # Cache hit = instant
-                else:
-                    # Retrieve memories
-                    memory_results = await self.memory.search(query, user_id=user_id, limit=5)
-                    
-                    # Detailed mem0 logging
-                    logger.info(f"🧠 MEM0 SEARCH RESULTS (Normal Query Path):")
-                    logger.info(f"   Query: '{query[:50]}...'")
-                    logger.info(f"   User ID: {user_id}")
-                    logger.info(f"   Raw results type: {type(memory_results)}")
-                    logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
-                    logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
-                    
-                    # Log each individual memory
-                    if isinstance(memory_results, dict) and 'results' in memory_results:
-                        for idx, item in enumerate(memory_results.get('results', [])):
-                            logger.info(f"   Memory {idx + 1}:")
-                            logger.info(f"      Content: {item.get('memory', 'N/A')}")
-                            logger.info(f"      Score: {item.get('score', 'N/A')}")
-                            logger.info(f"      Metadata: {item.get('metadata', {})}")
-                    else:
-                        logger.info(f"   ⚠️ No results or unexpected format")
-                    
-                    memories = "\n".join([
-                        f"- {item['memory']}" 
-                        for item in memory_results.get("results", []) 
-                        if item.get("memory")
-                    ]) or "No previous context."
 
-                    logger.info(f" Retrieved memories: {memories}")
-                    analysis_start = datetime.now()
-                    
-                    # Perform analysis
-                    analysis = await self._comprehensive_analysis(query, chat_history, memories)
-                    analysis_time = (datetime.now() - analysis_start).total_seconds()
-                    logger.info(f" Analysis completed in {analysis_time:.2f}s")
-                    
-                    # Cache the analysis
-                    await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
+                logger.info(f" Retrieved memories: {memories}")
+                analysis_start = datetime.now()
+                
+                # Perform analysis
+                analysis = await self._comprehensive_analysis(query, chat_history, memories)
+                analysis_time = (datetime.now() - analysis_start).total_seconds()
+                logger.info(f" Analysis completed in {analysis_time:.2f}s")
+                
+                # Cache the analysis
+                await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
             
             # LOG: Enhanced analysis results
             logger.info(f" ANALYSIS RESULTS:")
             logger.info(f"   Intent: {analysis.get('semantic_intent', 'Unknown')}")
+            
+            # LOG: Reasoning about tool selection
+            expansion_reasoning = analysis.get('expansion_reasoning', '')
+            if expansion_reasoning:
+                logger.info(f"   🧠 Model Reasoning: {expansion_reasoning}")
+            
             business_opp = analysis.get('business_opportunity', {})
             logger.info(f"   Business Confidence: {business_opp.get('composite_confidence', 0)}/100")
             logger.info(f"   Engagement Level: {business_opp.get('engagement_level', 'none')}")
@@ -356,91 +181,10 @@ class OptimizedAgent:
                 logger.info(f"   Execution Order: {tool_execution.get('order', [])}")
                 logger.info(f"   Dependency Reason: {tool_execution.get('dependency_reason', 'N/A')}")
             
-            # Extract scraping guidance if web_search is used
-            scraping_guidance = analysis.get('scraping_guidance', {})
-            if scraping_guidance:
-                logger.info(f"   Scraping Guidance: {scraping_guidance}")
-                for tool_key, guidance in scraping_guidance.items():
-                    logger.info(f"      {tool_key}: {guidance.get('scraping_level')} "
-                              f"({guidance.get('scraping_count')} pages) - {guidance.get('scraping_reason')}")
-            
-            # STEP 2: Extract tools_to_use FIRST (needed for confirmation payload)
+            # STEP 2: Extract tools_to_use
             tools_to_use = analysis.get('tools_to_use', [])
             
-            # STEP 3: Check if scraping needs confirmation (AFTER tools_to_use is defined)
-            if ENABLE_SCRAPING_CONFIRMATION and scraping_guidance and self._needs_confirmation(scraping_guidance):
-                estimated_time = self._estimate_scraping_time(scraping_guidance)
-                
-                # Count total pages correctly - check tool_key names, not dict values
-                total_pages = sum(
-                    g.get('scraping_count', 0) 
-                    for tool_key, g in scraping_guidance.items()
-                    if 'web_search' in tool_key
-                )
-                
-                logger.info(f"⚠️ High scraping detected ({total_pages} pages) - requesting user confirmation")
-                
-                # Generate confirmation token
-                token = str(uuid.uuid4())
-                
-                # Build payload for pending confirmation
-                pending_payload = {
-                    "query": query,
-                    "analysis": analysis,
-                    "tools_to_use": tools_to_use,
-                    "scraping_guidance": scraping_guidance,
-                    "estimated_time_secs": estimated_time,
-                    "chat_history": chat_history
-                }
-                
-                # Store pending confirmation
-                stored = await self.cache_manager.set_pending_confirmation(
-                    token=token,
-                    payload=pending_payload,
-                    user_id=user_id
-                )
-                
-                if stored:
-                    # Return confirmation request to user
-                    confirmation_message = (
-                        f"This query requires scraping {total_pages} pages, which will take approximately "
-                        f"{estimated_time} seconds. Would you like to continue? (Reply 'yes' to proceed or 'no' "
-                        f"for faster minimal scraping)"
-                    )
-                    
-                    logger.info(f"💬 Asking user for confirmation: {confirmation_message}")
-                    
-                    # Save original query and confirmation message to memory BEFORE returning
-                    # This ensures conversation is preserved even if user changes topic
-                    await self.task_queue.put(
-                        AddBackgroundTask(
-                            func=partial(self.memory.add),
-                            params=(
-                                [{"role": "user", "content": query}, {"role": "assistant", "content": confirmation_message}],
-                                user_id,
-                            ),
-                        )
-                    )
-                    logger.info(f"💾 Saved confirmation exchange to memory")
-                    
-                    return {
-                        "success": True,
-                        "needs_confirmation": True,
-                        "confirmation_token": token,
-                        "estimated_time_secs": estimated_time,
-                        "total_pages": total_pages,
-                        "response": confirmation_message,
-                        "message": confirmation_message  # For compatibility
-                    }
-                else:
-                    logger.warning(f"⚠️ Failed to store confirmation - proceeding without confirmation")
-                    # Fall through to normal execution
-            
-            # STEP 4: Execute tools (for normal/non-confirmation queries only)
-            # Note: For high-scrape queries, tool execution happens in _resume_with_confirmation()
-            # after user responds to confirmation prompt. This ensures cache is checked with
-            # the correct scraping level (HIGH if yes, LOW if no).
-            
+            # STEP 3: Execute tools
             tool_start = datetime.now()
             tool_results = await self._execute_tools(
                 tools_to_use,
@@ -454,7 +198,7 @@ class OptimizedAgent:
             # Cache the tool results
             if tool_results:
                 await self.cache_manager.cache_tool_results(
-                    query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
+                    query, tools_to_use, tool_results, user_id, ttl=3600
                 )
             
             if tool_results:
@@ -535,7 +279,6 @@ class OptimizedAgent:
             
             logger.info(f" TOTAL PROCESSING TIME: {total_time:.2f}s ({llm_calls} LLM calls)")
             logger.info(f" ANALYSIS CACHE: {'HIT ✅' if cached_analysis else 'MISS ❌'}")
-            # Note: Tool cache is checked inside _resume_with_confirmation() for high-scrape queries
             
             return {
                 "success": True,
@@ -546,7 +289,7 @@ class OptimizedAgent:
                 "execution_mode": execution_mode,
                 "business_opportunity": analysis.get('business_opportunity', {}),
                 "analysis_cache_hit": bool(cached_analysis),
-                "tools_cache_hit": False,  # Always False in normal flow; cache checked in confirmation flow
+                "tools_cache_hit": False,  # Tools are always executed fresh
                 "processing_time": {
                     "analysis": analysis_time,
                     "tools": tool_time,
@@ -563,149 +306,6 @@ class OptimizedAgent:
                 "response": "I apologize, but I encountered an error. Please try again."
             }
     
-    async def _resume_with_confirmation(self, pending: Dict, user_decision: str, start_time: datetime) -> Dict[str, Any]:
-        """
-        Resume processing after user confirmation
-        
-        Args:
-            pending: Pending confirmation payload
-            user_decision: 'yes' or 'no'
-            start_time: Original start time for timing
-        
-        Returns:
-            Processing result dict
-        """
-        query = pending.get('query')
-        analysis = pending.get('analysis')
-        tools_to_use = pending.get('tools_to_use', [])
-        scraping_guidance = pending.get('scraping_guidance', {})
-        chat_history = pending.get('chat_history', [])
-        user_id = pending.get('user_id')
-        
-        logger.info(f"📝 Resuming query: '{query}' with decision: {user_decision}")
-        
-        # If user said no, downgrade scraping to low (1 page)
-        if user_decision == 'no':
-            logger.info(f"⬇️ Downgrading scraping to low (1 page) for all web_search tools")
-            for tool_key in scraping_guidance:
-                if 'web_search' in tool_key:
-                    scraping_guidance[tool_key] = {
-                        "scraping_level": "low",
-                        "scraping_count": 1,
-                        "scraping_reason": "User declined high scraping"
-                    }
-            
-            # CRITICAL: Update analysis object with modified scraping_guidance
-            # because _execute_tools reads from analysis, not from parameters
-            analysis['scraping_guidance'] = scraping_guidance
-            logger.info(f"✅ Updated analysis with downgraded scraping guidance")
-        
-        # Check cache first (use modified scraping_guidance for cache key)
-        cached_tool_results = await self.cache_manager.get_cached_tool_results(
-            query, tools_to_use, user_id, scraping_guidance
-        )
-        
-        if cached_tool_results:
-            tool_results = cached_tool_results
-            tools_cache_hit = True
-            tool_time = 0.0
-            logger.info(f"🎯 Cache HIT for resumed query")
-        else:
-            # Execute tools
-            tool_start = datetime.now()
-            tool_results = await self._execute_tools(
-                tools_to_use,
-                query,
-                analysis,
-                user_id
-            )
-            tool_time = (datetime.now() - tool_start).total_seconds()
-            tools_cache_hit = False
-            
-            # Cache the results
-            if tool_results:
-                await self.cache_manager.cache_tool_results(
-                    query, tools_to_use, tool_results, user_id, scraping_guidance, ttl=3600
-                )
-        
-        # Log results
-        if tool_results:
-            logger.info(f" TOOL RESULTS SUMMARY:")
-            for tool_name, result in tool_results.items():
-                if isinstance(result, dict) and result.get('success'):
-                    logger.info(f"   {tool_name}: SUCCESS - {len(str(result))} chars of data")
-        
-        # Get memories for response generation
-        memory_results = await self.memory.search(query, user_id=user_id, limit=5)
-        
-        # Detailed mem0 logging
-        logger.info(f"🧠 MEM0 SEARCH RESULTS (Resume Confirmation Path):")
-        logger.info(f"   Query: '{query[:50]}...'")
-        logger.info(f"   User ID: {user_id}")
-        logger.info(f"   Raw results type: {type(memory_results)}")
-        logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
-        logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
-        
-        # Log each individual memory
-        if isinstance(memory_results, dict) and 'results' in memory_results:
-            for idx, item in enumerate(memory_results.get('results', [])):
-                logger.info(f"   Memory {idx + 1}:")
-                logger.info(f"      Content: {item.get('memory', 'N/A')}")
-                logger.info(f"      Score: {item.get('score', 'N/A')}")
-                logger.info(f"      Metadata: {item.get('metadata', {})}")
-        else:
-            logger.info(f"   ⚠️ No results or unexpected format")
-        
-        memories = "\n".join([
-            f"- {item['memory']}" 
-            for item in memory_results.get("results", []) 
-            if item.get("memory")
-        ]) or "No previous context."
-        
-        # Generate response
-        response_start = datetime.now()
-        final_response = await self._generate_response(
-            query,
-            analysis,
-            tool_results,
-            chat_history,
-            memories=memories
-        )
-        
-        # Add to memory
-        await self.task_queue.put(
-            AddBackgroundTask(
-                func=partial(self.memory.add),
-                params=(
-                    [{"role": "user", "content": query}, {"role": "assistant", "content": final_response}],
-                    user_id,
-                ),
-            )
-        )
-        
-        response_time = (datetime.now() - response_start).total_seconds()
-        total_time = (datetime.now() - start_time).total_seconds()
-        
-        execution_mode = analysis.get('tool_execution', {}).get('mode', 'parallel')
-        
-        return {
-            "success": True,
-            "response": final_response,
-            "analysis": analysis,
-            "tool_results": tool_results,
-            "tools_used": tools_to_use,
-            "execution_mode": execution_mode,
-            "business_opportunity": analysis.get('business_opportunity', {}),
-            "analysis_cache_hit": True,  # Analysis was cached from pending
-            "tools_cache_hit": tools_cache_hit,
-            "confirmation_decision": user_decision,
-            "processing_time": {
-                "analysis": 0.0,  # Cached from pending
-                "tools": tool_time,
-                "response": response_time,
-                "total": total_time
-            }
-        }
             
     async def background_task_worker(self) -> None:
         while True:
@@ -769,472 +369,228 @@ class OptimizedAgent:
         
         return guides.get(emotion, {}).get(intensity, "Be naturally helpful and friendly")
 
-    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None, memories:str = "", pending_confirmation: Optional[Dict] = None) -> Dict[str, Any]:
-        """Single LLM call for ALL analysis needs"""
-        logger.info(f" ANALYSIS DEBUG:")
-        logger.info(f"   Chat History Type: {type(chat_history)}")
-        logger.info(f"   Chat History Content: {chat_history}")
-        logger.info(f"   Chat History Length: {len(chat_history) if chat_history else 0}")
+    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None, memories:str = "") -> Dict[str, Any]:
+        """
+        Core semantic analysis + tool selection
+        Returns structured analysis with tool execution plan
+        """
+        from datetime import datetime
         
-        # Build context from chat history
         context = chat_history[-2:] if chat_history else []
-        logger.info(f"   Built Context: '{context}'")
+        current_date = datetime.now().strftime("%B %d, %Y")
         
-        # Extract pending confirmation data if exists (for context section)
-        pending_info = None
-        if pending_confirmation:
-            pending_info = {
-                'query': pending_confirmation.get('payload', {}).get('query', ''),
-                'estimated_time': pending_confirmation.get('payload', {}).get('estimated_time_secs', 0),
-                'total_pages': pending_confirmation.get('payload', {}).get('total_pages', 0)
-            }
-            logger.info(f"📋 Pending confirmation detected: {pending_info['query'][:50]}...")
-        
-        # Build pending context string for main prompt
-        pending_context = ""
-        if pending_info:
-            pending_context = f"""
-PENDING ACTION AWAITING USER RESPONSE:
-- Original Query: "{pending_info['query']}"
-- Action Required: Scrape {pending_info['total_pages']} pages (~{pending_info['estimated_time']} seconds)
-- System Asked: "Would you like to continue? (yes/no)"
-"""
-        
-        # Create comprehensive prompt that does everything in one shot
-        analysis_prompt = f"""You are analyzing queries for Mochan-D - an AI chatbot solution that:
-- Automates customer support and sales (24/7 availability)
-- Works across multiple platforms (WhatsApp, Facebook, Instagram, etc.)
-- Uses RAG + Web Search for intelligent responses
-- Serves businesses of all sizes needing to scale customer communication
+        analysis_prompt = f"""You are analyzing a user query for Mochan-D as of {current_date} - an AI chatbot that automates customer support across WhatsApp, Facebook, Instagram with RAG and web search capabilities.
 
-LONG-TERM CONTEXT (Memories): {memories}
-RECENT CONVERSATION: {context}
-{pending_context}
+Available tools:
+- web_search: Current internet data
+- rag: Knowledge base retrieval  
+- calculator: Math operations
+
 USER QUERY: {query}
 
-AVAILABLE TOOLS:
-- web_search: Search internet for current information
-- rag: Retrieve from uploaded knowledge base  
-- calculator: Perform calculations and analysis
+LONG-TERM CONTEXT (Memories): {memories}
+CONVERSATION HISTORY: {context}
 
-Perform ALL of the following analyses in ONE response:
+CRITICAL INSTRUCTION - DATA FRESHNESS:
+- Any information that is liable to change, USE web-search to validate that. For standard definitions and facts, use your base data. Based on that, expand on the dimensionality aspect to retrieve all that information at once.
+- Think deeply for every possibilities do not leave things by assuming anything
+CORE PRINCIPLE: Think like a world-class consultant.
+When someone asks for X, you don't just give X. You think: "What else do they need to make X truly successful?"
 
-1. MULTI-TASK DETECTION & DECOMPOSITION:
-   - Analyze the user query to identify if it contains multiple distinct, actionable tasks or questions.
-   - Look for:
-     * Multiple questions separated by "and", "also", "plus", or similar connectors
-     * Different types of information requests (e.g., weather + recommendations, prices + comparisons)
-     * Sequential tasks where one leads to another
-     * Independent tasks that can be handled separately
+Your superpower: MULTI-DIMENSIONAL REASONING
+- User mentions restaurant recommendations → Think: What about parking? Dietary restrictions? Price range?
+- User asks for laptop → Think: What about accessories? Software? Warranty options?
+- User wants recipe → Think: What about substitutes? Cooking tips? Storage instructions?
+
+THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
+
+1. WHAT DOES THE USER REALLY WANT?
+   - Look beyond the literal words - what's their actual goal?
+   - What emotional state are they in?
+   - Is this one request or multiple separate things?
+
+2. INFORMATION QUALITY CHECK - THINK BEYOND THE OBVIOUS
+   Ask yourself repeatedly: "What am I missing?"
    
-   - If 2 or more distinct tasks are found:
-     * Set `multi_task_detected` to `true`
-     * List each task clearly in the `sub_tasks` array
-     * Determine if tasks are dependent (sequential) or independent (parallel)
+   - If I answer just what they asked, will it be complete?
+   - What did the user NOT mention but would obviously need?
+   - What alternatives or related options should they consider?
+   - What context or background would make this more valuable?
    
-   - If only one task is found, set `multi_task_detected` to `false`
+   MULTI-DIMENSIONAL THINKING:
+   Don't just answer the literal question. Think about:
+   - WHAT they asked for (explicit need)
+   - WHAT they forgot to ask (implicit need)
+   - WHAT alternatives exist (options they should know about)
+   - WHAT context matters (surrounding information)
    
-   - Examples:
-     * "What's the weather in Lucknow and what should I wear?" → 2 tasks: [weather query, clothing recommendation]
-     * "iPhone 16 price and Samsung S24 price" → 2 tasks: [iPhone pricing, Samsung pricing]
-     * "Compare our product with competitors" → 1 task: [product comparison]
-
-2. SEMANTIC INTENT ANALYSIS:
+   Mental process training:
+   User says: "best laptop for video editing"
+   Your thinking: "They said video editing... but they'll also need: storage solutions (external drives),
+   editing software recommendations, color-accurate monitors, backup strategies. That's 5 dimensions:
+   laptop specs + storage + software + display + backup. Each needs separate focused research."
    
-   A. Understand the user's TRUE goal:
-      - What do they actually want to achieve?
-      - Consider their emotional state (urgent? frustrated? casual?)
-      - What's the REAL intent behind their words?
-      
-   B. Synthesize understanding:
-      - Based on decomposed tasks (from step 1), what is the user's ultimate goal?
-      - Include every specific number, measurement, name, date, and technical detail from the query
-      - Consider emotional cues, urgency signals, and conversation context
+   Use this expansion mindset for EVERY query.
 
-3. MOCHAN-D PRODUCT OPPORTUNITY ANALYSIS:
-   Does the user's query relate to problems that Mochan-D's AI chatbot solution can solve?
-
-
-   MOCHAN-D-SPECIFIC TRIGGERS (check for these pain points):
-   - Customer support automation needs
-   - High customer service costs or staff burden 
-   - Need for 24/7 customer availability
-   - Multiple messaging platform management difficulties (WhatsApp, Facebook, Instagram)
-   - Repetitive customer query handling
-   - Customer engagement/response time issues
-   - Integration needs with CRM/payment systems for customer communication
-   - Scaling customer communication challenges
-
-   CONTEXTUAL TRIGGERS (Score: 50-70):
-    - Mentions competitors
-    - Asks "how to improve..." business processes
-    - Growth/scaling discussions
-    - Team efficiency concerns
-    
-   EMOTIONAL CUES (Score: 40-60):
-   - Frustration → Empathy + solution
-   - Celebration → Join joy, suggest growth
-   - Worry → Reassurance + clarity
+3. IS THIS A BUSINESS PROBLEM?
+   Think naturally: Does this query relate to challenges that an AI chatbot could solve?
+   - Customer communication problems?
+   - Need for automation or always-available support?
+   - Managing multiple platforms or scaling interactions?
    
-   Set business_opportunity.detected = true if query shows ANY of:
-   - User states a current problem/challenge
-   - User is actively seeking/evaluating solutions
-   - User expresses dissatisfaction with current situation
-   - User mentions "need", "looking for", "considering", "want to improve"
+   If yes → this is a business context (you should include rag to provide Mochan-D context)
+   If no → just answer the query directly
 
-
-   CONFIDENCE SCORING:
-   composite_confidence = (work_context + emotional_distress + solution_seeking + scale_scope) / 4
+4. MULTI-DIMENSIONAL TASK BREAKDOWN - FIND ALL THE HIDDEN ANGLES
    
-   - work_context: 0-100 (Business vs personal)
-   - emotional_distress: 0-100 (Frustration/stress level)
-   - solution_seeking: 0-100 (Actively looking for help?)
-   - scale_scope: 0-100 (Size/urgency of problem)
+   Your job: Identify EVERY dimension of this query, including what user didn't explicitly say.
    
-   Score Bands:
-   0-30: No business context → pure_empathy
-   31-50: Ambiguous → empathetic_probing
-   51-70: Possible → gentle_suggestion
-   71-85: Clear pain → soft_pitch
-   86-100: Hot lead → direct_consultation
-
-
-   DO NOT trigger business_opportunity.detected = true for:
-   - Pure research/comparison without context ("Compare X vs Y")
-   - Definition questions ("What is X")
-   - General knowledge inquiries
-   - Personal health, relationships, entertainment
-   - Weather, jokes, casual chat (unless leads to business context)
-   - Pet problems, family issues
-
-
-   If business opportunity detected:
-   - Set business_opportunity.detected = true
-   - Add "rag" to tools_to_use (fetch Mochan-D product docs)
-
-
-   If query is about other business areas (accounting, inventory, website, etc.):
-   - Set business_opportunity.detected = false
-
-4. TOOL SELECTION FOR MULTI-TASK QUERIES:
-
-   For EACH sub-task identified in step 1, select the most appropriate tool:
+   CRITICAL MINDSET: When you think you have enough searches, DOUBLE IT.
+   Most people under-search. You're smarter than that.
    
-   GENERAL TOOL SELECTION:
-   - `web_search`: For current information, prices, comparisons, weather, news, etc.
-   - `calculator`: For mathematical calculations, statistical operations
+   Step 1: What did they LITERALLY ask for?
+   Step 2: What did they IMPLY but not say?
+   Step 3: What ALTERNATIVES should they know about?
+   Step 4: What RELATED INFORMATION would be valuable?
+   Step 5: What would a world-class expert include that others miss?
    
-    AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
-    Select `rag` if ANY of:
-    1. Any sub-task is directly ABOUT Mochan-D
-    2. OR business_opportunity.detected = true
-    3. OR web_search is selected for ANY sub-task
-    
-    If rag should be added, add ONE `rag` to tools_to_use
- 
-   IMPORTANT: The `tools_to_use` array should contain one tool for each sub-task.
-   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search", "rag"]
-   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator", "rag"]
+   Mental exercise for EVERY query:
+   - If they mention ONE audience, are there OTHER audiences? (Create separate search for EACH)
+   - If they ask for ONE thing, what RELATED things do they need? (Separate search for EACH)
+   - If they want X, should they also know about Y and Z? (Separate search for EACH)
+   - What examples would make this concrete? (Separate search)
+   - What data would make this credible? (Separate search)
+   - What best practices exist? (Separate search)
+   - What alternatives or comparisons? (Separate search)
+   
+   RULE: Create a SEPARATE search for EACH dimension you discover.
+   Don't merge dimensions - keep each one focused and distinct.
+   If you're generating less than 5 searches for a complex query, you're missing dimensions.
 
-   Use NO tools for:
-   - Greetings, casual chat
-   - General knowledge questions that don't require current information
+5. HOW TO FORMAT YOUR QUERIES (CRITICAL):
+   
+   For web_search queries:
+   - Write like you're typing into Google: SHORT, keyword-focused
+   - Keep it under 6-8 words maximum
+   - Focus on core terms only
+   - Include year (2025) for time-sensitive topics
+   
+   For rag queries:
+   - Natural language is OK: "product features value proposition"
+   - You're searching internal documents
 
-5. SENTIMENT & PERSONALITY:
-   - User's emotional state (frustrated/excited/casual/urgent/confused)
-   - Best response personality (empathetic_friend/excited_buddy/helpful_dost/urgent_solver/patient_guide)
+6. TOOL ORCHESTRATION - CAN DIFFERENT TOOLS RUN TOGETHER?
+   
+   Think about dependencies BETWEEN tool types (not within same tool type):
+   
+   Ask yourself: "Does one tool type NEED results from another tool type to work properly?"
+   
+   - Does web_search need rag data first to search effectively? → sequential
+   - Does rag need web_search results to query properly? → sequential  
+   - Can they work independently with just the user's query? → parallel
+   
+   Default to PARALLEL unless there's a clear logical dependency.
+   
+   Note: All web_search queries always run parallel among themselves.
+   This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
 
-6. RESPONSE STRATEGY:
-   - Response length (micro/short/medium/detailed)
-   - Language style (hinglish/english/professional/casual)
+7. HOW SHOULD THE RESPONSE FEEL?
+   Based on the user's tone and needs:
+   - What personality would work best? (empathetic, professional, casual, excited, urgent)
+   - How much detail do they need? (brief, moderate, comprehensive)
+   - What language style fits? (formal english, casual english, hinglish)
 
-7. WEB SCRAPING GUIDANCE (FOR WEB_SEARCH TOOL):
+FINAL CHECK BEFORE YOU OUTPUT:
+- Did I find ALL dimensions of this query?
+- Am I being generous with search count or conservative? (Be generous!)
+- Did I use proper key names? (rag_0, web_search_0, web_search_1, etc.)
+- For complex queries: Did I generate at least 5-7 searches?
+- Did I keep the EXACT JSON structure below?
 
-   When web_search is selected, determine appropriate scraping intensity:
-   
-   SCRAPING LEVELS:
-   - "low" (1 page): Simple factual queries, quick lookups, single-source answers
-     Examples: "what is capital of France", "current time", "definition of X"
-   
-   - "medium" (3 pages): Comparison queries, multi-source verification, moderate depth
-     Examples: "compare iPhone vs Samsung", "best restaurants in Lucknow", "product reviews"
-   
-   - "high" (5 pages): Complex research, comprehensive analysis, multi-faceted queries
-     Examples: "analyze market trends", "competitive landscape", "in-depth technical comparison"
-   
-   DECISION RULES:
-   1. Query complexity: Simple fact → low, Comparison → medium, Research → high
-   2. Expected answer breadth: Single point → low, Multiple points → medium, Comprehensive → high
-   3. Verification needs: No verification → low, Cross-check → medium, Thorough validation → high
-   
-   For EACH web_search tool in tools_to_use, provide scraping guidance:
-   - Set `scraping_level`: "low", "medium", or "high"
-   - Set `scraping_count`: corresponding number (1, 3, or 5)
-   - Include brief `scraping_reason`: why this level is appropriate
-   
-   If NO web_search tool is used, omit scraping_guidance entirely.
-   
-   IMPORTANT: For indexed tools (web_search_0, web_search_1), provide guidance for EACH:
-   {{
-     "scraping_guidance": {{
-       "web_search_0": {{
-         "scraping_level": "medium",
-         "scraping_count": 3,
-         "scraping_reason": "Comparison query requires multiple sources"
-       }},
-       "web_search_1": {{
-         "scraping_level": "low",
-         "scraping_count": 1,
-         "scraping_reason": "Simple factual lookup"
-       }}
-     }}
-   }}
+OUTPUT THIS EXACT JSON STRUCTURE:
 
-8. DEPENDENCY & EXECUTION PLANNING FOR MULTI-TASK QUERIES:
-
-    Step 1: Analyze task dependencies
-    
-    DEFAULT = PARALLEL (tasks are independent)
-    
-    For each sub-task, ask: "Does this task need information from another task to complete?"
-    
-    Common dependency patterns:
-    - Weather + clothing recommendation → SEQUENTIAL (clothing depends on weather data)
-    - Product features + competitor comparison → SEQUENTIAL (comparison needs product info)
-    - iPhone price + Samsung price → PARALLEL (completely independent)
-    - Math calculation + web search for formula → SEQUENTIAL (calculation needs formula)
-    
-    Step 2: Create execution plan with indexed tool names
-    
-    CRITICAL: Create unique indexed names for each tool execution:
-    - Format: `tool_name_index` (e.g., `web_search_0`, `web_search_1`, `rag_0`)
-    - The `order` array must contain these indexed names
-    - The `enhanced_queries` object keys must EXACTLY match the indexed names in `order`
-    
-    Step 3: Generate queries for each indexed tool
-    
-    For PARALLEL mode:
-    - Each indexed tool gets its own specific query based on its corresponding sub-task
-    - Example: `web_search_0`: "iPhone 16 price", `web_search_1`: "Samsung S24 price"
-    
-    For SEQUENTIAL mode:
-    - ONLY the first indexed tool (position 0) gets a real query
-    - ALL subsequent tools get "WAIT_FOR_PREVIOUS"
-    - Example: `rag_0`: "Mochan-D features", `web_search_0`: "WAIT_FOR_PREVIOUS"
-    
-    Query optimization rules:
-    - RAG: "Mochan-D" + [specific topic from sub-task]
-    - Calculator: Extract numbers from sub-task, create valid Python expression
-    - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
-
-9. CONFIRMATION RESPONSE ANALYSIS:
-
-   Check if there is a PENDING ACTION in the context above.
-   
-   If PENDING ACTION EXISTS:
-   
-   The system asked: "Would you like to continue? (yes/no)"
-   
-   Identify the SUBJECT of the user's message:
-   
-   What is the user's message ABOUT?
-   What is the user REFERRING to?
-   
-   If the message is ABOUT the pending action (answering the yes/no question):
-   → Classify based on their answer:
-      - Affirmative answer → "approve"
-      - Negative answer or urgency for fast alternative → "decline"
-   
-   If the message is NOT about the pending action:
-   → Classify as "new_query"
-   → This includes: statements about other things, new questions, comments not related to the pending action
-   
-   Set confidence 0-100 based on clarity of subject identification.
-   
-   Reasoning: State what the subject of the message is and whether it refers to the pending action.
-   
-   If NO PENDING ACTION EXISTS:
-   - has_pending: false
-   - user_intent: "new_query"
-   - confidence: 100
-
-    EXAMPLES OF MULTI-TASK HANDLING:
-
-    Example 1 - Multi-task Parallel (Independent tasks):
-    Query: "What's today's weather in Lucknow and iPhone 16 price"
-    Multi-task Analysis: 2 independent tasks → parallel
-    Output:
-    {{
-    "multi_task_analysis": {{
-        "multi_task_detected": true,
-        "sub_tasks": ["Get today's weather for Lucknow", "Find iPhone 16 price"]
-    }},
-    "tools_to_use": ["web_search", "web_search"],
-    "tool_execution": {{
-        "mode": "parallel",
-        "order": ["web_search_0", "web_search_1"],
-        "dependency_reason": "Weather and phone pricing are independent queries"
-    }},
-    "enhanced_queries": {{
-        "web_search_0": "today weather Lucknow",
-        "web_search_1": "iPhone 16 price 2025"
-    }}
-    }}
-
-    Example 2 - Multi-task Sequential (Dependent tasks):
-    Query: "What's today's weather in Lucknow and what should I wear?"
-    Multi-task Analysis: 2 dependent tasks → sequential
-    Output:
-    {{
-    "multi_task_analysis": {{
-        "multi_task_detected": true,
-        "sub_tasks": ["Get today's weather for Lucknow", "Get clothing recommendation based on weather"]
-    }},
-    "tools_to_use": ["web_search", "web_search"],
-    "tool_execution": {{
-        "mode": "sequential",
-        "order": ["web_search_0", "web_search_1"],
-        "dependency_reason": "Clothing recommendation depends on weather data"
-    }},
-    "enhanced_queries": {{
-        "web_search_0": "today weather Lucknow temperature conditions",
-        "web_search_1": "WAIT_FOR_PREVIOUS"
-    }}
-    }}
-
-    Example 3 - Single task:
-    Query: "what is my product?"
-    Multi-task Analysis: 1 task → single execution
-    Output:
-    {{
-    "multi_task_analysis": {{
-        "multi_task_detected": false,
-        "sub_tasks": ["Get information about Mochan-D product"]
-    }},
-    "tools_to_use": ["rag"],
-    "tool_execution": {{
-        "mode": "parallel",
-        "order": ["rag_0"],
-        "dependency_reason": ""
-    }},
-    "enhanced_queries": {{
-        "rag_0": "Mochan-D product information features"
-    }}
-    }}
-
-Return ONLY valid JSON:
 {{
-    "multi_task_analysis": {{
-        "multi_task_detected": true/false,
-        "sub_tasks": ["description of task 1", "description of task 2"]
+  "multi_task_analysis": {{
+    "multi_task_detected": true or false,
+    "sub_tasks": ["description of task 1", "description of task 2"]
+  }},
+  "semantic_intent": "clear description of overall user goal",
+  "expansion_reasoning": "your thought process why keeping simple OR why adding more searches",
+  "business_opportunity": {{
+    "detected": true or false,
+    "composite_confidence": 0-100,
+    "engagement_level": "direct_consultation|gentle_suggestion|empathetic_probing|pure_empathy",
+    "signal_breakdown": {{
+      "work_context": 0-100,
+      "emotional_distress": 0-100,
+      "solution_seeking": 0-100,
+      "scale_scope": 0-100
     }},
-    "semantic_intent": "clear description of overall user goal",
-    "confirmation_response": {{
-        "has_pending": true/false,
-        "user_intent": "approve|decline|new_query|ambiguous",
-        "confidence": 0-100,
-        "reasoning": "Brief explanation based on semantic analysis of user's TRUE intent"
-    }},
-    "business_opportunity": {{
-        "detected": true/false,
-        "composite_confidence": 0-100,
-        "engagement_level": "direct_consultation|gentle_suggestion|empathetic_probing|pure_empathy",
-        "signal_breakdown": {{
-            "work_context": 0-100,
-            "emotional_distress": 0-100,
-            "solution_seeking": 0-100,
-            "scale_scope": 0-100
-        }},
-        "pain_points": ["specific problems"],
-        "solution_areas": ["how Mochan-D helps 1", "solution 2"],
-        "recommended_approach": "empathy_first|solution_focused|consultation_ready"
-    }},
-    "tools_to_use": ["tool1", "tool2"],
-    "tool_execution": {{
-        "mode": "sequential|parallel",
-        "order": ["tool1", "tool2"],
-        "dependency_reason": "why sequential is needed"
-    }},
-    "enhanced_queries": {{
-        "web_search": "optimized search query or WAIT_FOR_PREVIOUS",
-        "rag": "optimized rag query",
-        "calculator": "clear calculation"
-    }},
-    "scraping_guidance": {{
-        "web_search_0": {{
-            "scraping_level": "low|medium|high",
-            "scraping_count": 1|3|5,
-            "scraping_reason": "why this level"
-        }}
-    }},
-    "tool_reasoning": "why these tools",
-    "sentiment": {{
-        "primary_emotion": "frustrated|excited|casual|urgent|confused",
-        "intensity": "low|medium|high"
-    }},
-    "response_strategy": {{
-        "personality": "empathetic_friend|excited_buddy|helpful_dost|urgent_solver|patient_guide",
-        "length": "micro|short|medium|detailed",
-        "language": "hinglish|english|professional|casual",
-        "tone": "friendly|professional|empathetic|excited"
-    }},
-    "key_points_to_address": ["point1", "point2"]
-}}"""
+    "recommended_approach": "empathy_first|solution_focused|consultation_ready",
+    "pain_points": ["specific problem 1", "specific problem 2"],
+    "solution_areas": ["how Mochan-D helps 1", "solution 2"]
+  }},
+  "tools_to_use": ["tool1", "tool2"],
+  "tool_execution": {{
+    "mode": "sequential|parallel",
+    "order": ["tool1", "tool2"],
+    "dependency_reason": "why sequential is needed or empty if parallel"
+  }},
+  "enhanced_queries": {{
+    "rag_0": "query for rag",
+    "web_search_0": "first focused search",
+    "web_search_1": "second focused search"
+  }},
+  "tool_reasoning": "why these tools",
+  "sentiment": {{
+    "primary_emotion": "frustrated|excited|casual|urgent|confused",
+    "intensity": "low|medium|high"
+  }},
+  "response_strategy": {{
+    "personality": "empathetic_friend|excited_buddy|helpful_dost|urgent_solver|patient_guide",
+    "length": "micro|short|medium|detailed",
+    "language": "hinglish|english|professional|casual",
+    "tone": "friendly|professional|empathetic|excited"
+  }},
+  "key_points_to_address": ["point1", "point2"]
+}}
+
+Now analyze: {query}
+
+Think through each question naturally, then return ONLY the JSON. No other text."""
 
         try:
-            messages = []
-            messages.append({"role": "user", "content": analysis_prompt})
+            # messages = []
             
+            # Simple system prompt for thinking models
+            system_prompt = f"""You are analyzing queries as of {current_date}. Think step by step, then output valid JSON only."""
             
-            logger.info(f" CALLING BRAIN LLM for analysis...")
+            # messages.append({"role": "system", "content": system_prompt})
+            # messages.append({"role": "user", "content": analysis_prompt})
+            
             response = await self.brain_llm.generate(
-                messages,
+                messages=[{"role": "user", "content": analysis_prompt}],
+                system_prompt=system_prompt,
                 temperature=0.1,
-                system_prompt="You are an expert analyst. Analyze queries using multi-signal intelligence covering semantics, business opportunities, tool needs, and communication strategy. Return valid JSON only." 
+                max_tokens=16000
             )
             
-            # LOG: Raw LLM response
-            logger.info(f" BRAIN LLM RAW RESPONSE: {len(response)} chars")
-            logger.info(f" First 200 chars: {response[:200]}...")
+            json_str = self._extract_json(response)
+            result = json.loads(json_str)
             
-            # Clean response
-            cleaned = self._clean_json_response(response)
-            logger.info(f" CLEANED RESPONSE: {len(cleaned)} chars")
+            logging.info(f"✅ Analysis complete: {result.get('semantic_intent', 'N/A')[:100]}")
+            return result
             
-            analysis = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ JSON parse error: {e}")
+            logging.error(f"Response snippet: {response[:500] if response else 'No response'}")
             
-            # Ensure tool_execution exists with defaults
-            if 'tool_execution' not in analysis:
-                analysis['tool_execution'] = {
-                    'mode': 'parallel',
-                    'order': [],
-                    'dependency_reason': ''
-                }
-            
-            # LOG: Parsed analysis details
-            logger.info(f" Analysis complete: intent={analysis.get('semantic_intent')}, "
-                       f"business={analysis.get('business_opportunity', {}).get('detected')}, "
-                       f"confidence={analysis.get('business_opportunity', {}).get('composite_confidence', 0)}, "
-                       f"tools={analysis.get('tools_to_use', [])}")
-            
-            logger.info(f" FULL ANALYSIS GENERATED:")
-            logger.info(f"   Semantic Intent: {analysis.get('semantic_intent', 'Unknown')}")
-            logger.info(f"   Business Opportunity: {analysis.get('business_opportunity', {})}")
-            logger.info(f"   Tools to Use: {analysis.get('tools_to_use', [])}")
-            logger.info(f"   Tool Reasoning: {analysis.get('tool_reasoning', 'None')}")
-            logger.info(f"   Sentiment: {analysis.get('sentiment', {})}")
-            logger.info(f"   Response Strategy: {analysis.get('response_strategy', {})}")
-            logger.info(f"   Enhanced Queries: {analysis.get('enhanced_queries', {})}")
-            logger.info(f"   Tool Execution: {analysis.get('tool_execution', {})}")
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"Analysis failed: {e}")
-            # Return safe defaults
             return {
-                "semantic_intent": "general_inquiry",
+                "multi_task_analysis": {"multi_task_detected": False, "sub_tasks": []},
+                "semantic_intent": query,
+                "expansion_reasoning": "Fallback due to parse error",
                 "business_opportunity": {
-                    "detected": False, 
+                    "detected": False,
                     "composite_confidence": 0,
                     "engagement_level": "pure_empathy",
                     "signal_breakdown": {
@@ -1243,15 +599,14 @@ Return ONLY valid JSON:
                         "solution_seeking": 0,
                         "scale_scope": 0
                     },
-                    "recommended_approach": "empathy_first"
+                    "recommended_approach": "empathy_first",
+                    "pain_points": [],
+                    "solution_areas": []
                 },
                 "tools_to_use": [],
-                "tool_execution": {
-                    "mode": "parallel",
-                    "order": [],
-                    "dependency_reason": ""
-                },
+                "tool_execution": {"mode": "parallel", "order": [], "dependency_reason": ""},
                 "enhanced_queries": {},
+                "tool_reasoning": "Direct response needed",
                 "sentiment": {"primary_emotion": "casual", "intensity": "medium"},
                 "response_strategy": {
                     "personality": "helpful_dost",
@@ -1260,7 +615,7 @@ Return ONLY valid JSON:
                     "tone": "friendly"
                 }
             }
-    
+ 
     async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
         """Execute tools with smart parallel/sequential handling based on dependencies"""
         
@@ -1283,10 +638,26 @@ Return ONLY valid JSON:
         """Execute tools in parallel (handles duplicate tool names)"""
         results = {}
         enhanced_queries = analysis.get('enhanced_queries', {})
-        scraping_guidance = analysis.get('scraping_guidance', {})
         
         logger.info(f"Enhanced queries for parallel execution: {enhanced_queries}")
-        logger.info(f"Scraping guidance for parallel execution: {scraping_guidance}")
+        
+        # Check if LLMLayer is enabled and merge web_search queries
+        llmlayer_enabled = os.getenv('LLMLAYER_ENABLED', 'false').lower() == 'true'
+        
+        if llmlayer_enabled and 'web_search' in tools:
+            # Get all web_search queries
+            web_queries = [v for k, v in enhanced_queries.items() if k.startswith("web_search")]
+            
+            if len(web_queries) > 1:
+                # Merge queries with comma separator
+                merged_query = ", ".join(web_queries)
+                logger.info(f"🔀 LLMLayer enabled: Merging {len(web_queries)} web_search queries")
+                logger.info(f"   Combined query: {merged_query[:150]}...")
+                
+                # Replace all web_search queries with single merged one
+                new_queries = {k: v for k, v in enhanced_queries.items() if not k.startswith("web_search")}
+                new_queries["web_search_0"] = merged_query
+                enhanced_queries = new_queries
         
         # Execute tools in parallel for speed
         tasks = []
@@ -1298,23 +669,19 @@ Return ONLY valid JSON:
                 count = tool_counter.get(tool, 0)
                 tool_counter[tool] = count + 1
                 
-                # Try indexed key first, then fall back to non-indexed
-                indexed_key = f"{tool}_{i}"
+                # FIXED: Use tool-specific counter, not array index
+                # This matches how LLM generates indexed keys (web_search_0, web_search_1 per tool type)
+                indexed_key = f"{tool}_{count}"
                 tool_query = enhanced_queries.get(indexed_key) or enhanced_queries.get(tool, query)
                 
-                logger.info(f"🔧 {tool.upper()} #{i} ENHANCED QUERY: '{tool_query}'")
+                logger.info(f"🔧 {tool.upper()} #{count} ENHANCED QUERY: '{tool_query}'")
                 
-                # Get scraping params for web_search tools
-                scrape_count = None
-                if tool == 'web_search' and indexed_key in scraping_guidance:
-                    guidance = scraping_guidance[indexed_key]
-                    scrape_count = guidance.get('scraping_count', 3)
-                    scraping_level = guidance.get('scraping_level', 'medium')
-                    logger.info(f"   📊 Scraping: {scraping_level} level ({scrape_count} pages)")
-                    logger.info(f"   📋 Reason: {guidance.get('scraping_reason', 'N/A')}")
+                # Default scraping for web_search tools (always use 3 pages)
+                scrape_count = 3 if tool == 'web_search' else None
                 
-                # Store results with unique keys
-                result_key = f"{tool}_{i}" if count > 0 else tool
+                # FIXED: Store results with tool-type counter (web_search_0, web_search_1, etc.)
+                # Always use indexed key format for consistency
+                result_key = indexed_key
                 
                 # Build kwargs with scraping params if applicable
                 tool_kwargs = {"query": tool_query, "user_id": user_id}
@@ -1341,13 +708,11 @@ Return ONLY valid JSON:
         """Execute tools sequentially with middleware for dependent queries"""
         results = {}
         enhanced_queries = analysis.get('enhanced_queries', {})
-        scraping_guidance = analysis.get('scraping_guidance', {})
         tool_execution = analysis.get('tool_execution', {})
         order = tool_execution.get('order', tools)
         
         logger.info(f"   Execution order: {order}")
         logger.info(f"   Reason: {tool_execution.get('dependency_reason', 'N/A')}")
-        logger.info(f"   Scraping guidance: {scraping_guidance}")
         
         # Execute first tool
         first_tool_key = order[0]  # e.g., 'web_search_0'
@@ -1357,14 +722,10 @@ Return ONLY valid JSON:
         first_query = enhanced_queries.get(first_tool_key, query)
         logger.info(f"   → Step 1: Executing {first_tool_key.upper()} with query: '{first_query}'")
         
-        # Get scraping params for first tool if it's web_search
+        # Default scraping for web_search (always use 3 pages)
         first_tool_kwargs = {"query": first_query, "user_id": user_id}
-        if first_tool_name == 'web_search' and first_tool_key in scraping_guidance:
-            guidance = scraping_guidance[first_tool_key]
-            scrape_count = guidance.get('scraping_count', 3)
-            scraping_level = guidance.get('scraping_level', 'medium')
-            first_tool_kwargs["scrape_top"] = scrape_count
-            logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
+        if first_tool_name == 'web_search':
+            first_tool_kwargs["scrape_top"] = 3
         
         try:
             results[first_tool_key] = await self.tool_manager.execute_tool(first_tool_name, **first_tool_kwargs)
@@ -1397,14 +758,10 @@ Return ONLY valid JSON:
             # Execute current tool
             logger.info(f"   → Step {i+2}: Executing {current_tool_key.upper()} with query: '{enhanced_query}'")
             
-            # Get scraping params for current tool if it's web_search
+            # Default scraping for web_search (always use 3 pages)
             current_tool_kwargs = {"query": enhanced_query, "user_id": user_id}
-            if current_tool_name == 'web_search' and current_tool_key in scraping_guidance:
-                guidance = scraping_guidance[current_tool_key]
-                scrape_count = guidance.get('scraping_count', 3)
-                scraping_level = guidance.get('scraping_level', 'medium')
-                current_tool_kwargs["scrape_top"] = scrape_count
-                logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
+            if current_tool_name == 'web_search':
+                current_tool_kwargs["scrape_top"] = 3
             
             try:
                 results[current_tool_key] = await self.tool_manager.execute_tool(current_tool_name, **current_tool_kwargs)
@@ -1800,22 +1157,7 @@ Return ONLY valid JSON:
         except Exception as e:
             logger.error(f"Response generation failed: {e}")
             return "I apologize, but I had trouble generating a response. Could you please try again?"
-    
-    def _build_context(self, chat_history: List[Dict]) -> str:
-        """Build context from chat history"""
-        if not chat_history:
-            return "No previous context"
-        
-        recent = chat_history
-        context_parts = []
-        for item in recent:
-            if 'query' in item:
-                context_parts.append(f"User: {item['query']}")
-            elif 'content' in item:
-                context_parts.append(f"{item.get('role', 'user')}: {item['content']}")
-        
-        return " \n ".join(context_parts) if context_parts else "No previous context"
-    
+       
     def _format_tool_results(self, tool_results: dict) -> str:
         """Format tool results for response generation, handling different tool structures with Redis caching."""
         if not tool_results:
@@ -1856,6 +1198,13 @@ Return ONLY valid JSON:
         
         for tool, result in tool_results.items():
             if isinstance(result, dict) and 'error' not in result:
+                # Check if LLMLayer or Perplexity (pre-formatted responses)
+                if result.get('provider') in ['llmlayer', 'perplexity'] and 'llm_response' in result:
+                    provider_name = result.get('provider', '').upper()
+                    logger.info(f" {provider_name} pre-formatted response detected")
+                    formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\n")
+                    continue  # Skip scraping logic
+                
                 # Handle RAG-style result
                 if "success" in result and result["success"]:
                     logger.info(f" Formatting result for tool: {result}")
@@ -1955,6 +1304,34 @@ Return ONLY valid JSON:
                         phrases.append(sentence.strip()[:30])
         
         return phrases[-5:] if phrases else []
+    
+    def _extract_json(self, response: str) -> str:
+        """Extract JSON from LLM response (handles thinking models)"""
+        response = response.strip()
+        
+        # Remove thinking tags if present
+        if '<think>' in response:
+            end_idx = response.find('</think>')
+            if end_idx != -1:
+                response = response[end_idx + 8:].strip()
+        
+        # Remove markdown code blocks
+        if response.startswith('```'):
+            lines = response.split('\n')
+            if lines[0].startswith('```'):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == '```':
+                lines = lines[:-1]
+            response = '\n'.join(lines)
+        
+        # Find JSON boundaries
+        json_start = response.find('{')
+        json_end = response.rfind('}')
+        
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            return response[json_start:json_end+1]
+        
+        return response
     
     def _clean_json_response(self, response: str) -> str:
         """Clean LLM response for JSON parsing"""

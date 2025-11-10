@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
     brain_model_config = config.create_llm_config(
         provider=settings.brain_provider,
         model=settings.brain_model,
-        max_tokens=1000
+        max_tokens=16000 
     )
     heart_model_config = config.create_llm_config(
         provider=settings.heart_provider,
@@ -213,45 +213,45 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         
         safe_log_user_data(user_id, 'brain_heart_chat', message_count=len(user_query))
         
-        brain_provider = settings.brain_provider or os.getenv("BRAIN_LLM_PROVIDER")
-        brain_model = settings.brain_model or os.getenv("BRAIN_LLM_MODEL")
-        heart_provider = settings.heart_provider or os.getenv("HEART_LLM_PROVIDER")
-        heart_model = settings.heart_model or os.getenv("HEART_LLM_MODEL")
-        use_premium_search = settings.use_premium_search or os.getenv("USE_PREMIUM_SEARCH", "false").lower() == "true"
-        web_model = settings.web_model or os.getenv("WEB_LLM_MODEL", "")
+        # brain_provider = settings.brain_provider or os.getenv("BRAIN_LLM_PROVIDER")
+        # brain_model = settings.brain_model or os.getenv("BRAIN_LLM_MODEL")
+        # heart_provider = settings.heart_provider or os.getenv("HEART_LLM_PROVIDER")
+        # heart_model = settings.heart_model or os.getenv("HEART_LLM_MODEL")
+        # use_premium_search = settings.use_premium_search or os.getenv("USE_PREMIUM_SEARCH", "false").lower() == "true"
+        # web_model = settings.web_model or os.getenv("WEB_LLM_MODEL", "")
         
-        config = Config()
+        # config = Config()
         
-        brain_model_config = config.create_llm_config(
-            provider=brain_provider,
-            model=brain_model,
-            max_tokens=1000
-        )
-        heart_model_config = config.create_llm_config(
-            provider=heart_provider,
-            model=heart_model,
-            max_tokens=1000
-        )
-        web_model_config = config.get_tool_configs(
-            web_model=web_model,
-            use_premium_search=use_premium_search
-        )
+        # brain_model_config = config.create_llm_config(
+        #     provider=brain_provider,
+        #     model=brain_model,
+        #     max_tokens=16000      # Thinking models need lots of space for reasoning chains + JSON
+        # )
+        # heart_model_config = config.create_llm_config(
+        #     provider=heart_provider,
+        #     model=heart_model,
+        #     max_tokens=3000
+        # )
+        # web_model_config = config.get_tool_configs(
+        #     web_model=web_model,
+        #     use_premium_search=use_premium_search
+        # )
         
-        tool_manager = ToolManager(
-            config,
-            brain_model_config,
-            web_model,
-            use_premium_search
-        )
+        # tool_manager = ToolManager(
+        #     config,
+        #     brain_model_config,
+        #     web_model,
+        #     use_premium_search
+        # )
         
-        brain_llm = LLMClient(brain_model_config)
-        heart_llm = LLMClient(heart_model_config)
+        # brain_llm = LLMClient(brain_model_config)
+        # heart_llm = LLMClient(heart_model_config)
         
-        optimizedAgent = OptimizedAgent(
-            brain_llm,
-            heart_llm,
-            tool_manager
-        )
+        # optimizedAgent = OptimizedAgent(
+        #     brain_llm,
+        #     heart_llm,
+        #     tool_manager
+        # )
         
         result = await optimizedAgent.process_query(user_query, chat_history, user_id, mode)
         
