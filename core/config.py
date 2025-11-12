@@ -202,3 +202,6 @@ class Config:
             'available_web_models': self.available_web_models,
             'tool_configs': self.get_tool_configs()
         }
+        
+        
+ENABLE_SCRAPING_CONFIRMATION, SCRAPING_CONFIRMATION_THRESHOLD, ESTIMATED_TIME_PER_PAGE, ENABLE_LLM_CONFIRMATION_DETECTION = False, 5, 3, True  # For testing; override with .env or config as needed

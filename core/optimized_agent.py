@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from os import getenv
 from mem0 import AsyncMemory
+import time
 from functools import partial
 from mem0.configs.base import MemoryConfig
 from .config import AddBackgroundTask
@@ -120,8 +121,9 @@ class OptimizedAgent:
                 analysis_time = 0.0  # Cache hit = instant
             else:
                 # Retrieve memories
+                eli = time.time()
                 memory_results = await self.memory.search(query, user_id=user_id, limit=5)
-                
+                logger.info(f" Memory retrieval took {time.time() - eli:.2f}s")
                 # Detailed mem0 logging
                 logger.info(f"🧠 MEM0 SEARCH RESULTS:")
                 logger.info(f"   Query: '{query[:50]}...'")

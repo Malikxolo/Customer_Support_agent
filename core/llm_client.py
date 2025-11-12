@@ -40,7 +40,8 @@ class LLMClient:
     async def generate(self, messages: List[Dict[str, str]], 
                       temperature: float,                       # ✅ REQUIRED parameter
                       system_prompt: Optional[str] = None,
-                      max_tokens: Optional[int] = None) -> str:
+                      max_tokens: Optional[int] = None,
+                      thinking: Optional[bool]=False) -> str:
         """Generate response using configured LLM"""
         
         logger.info(f"🤖 API call: {self.config.provider}/{self.config.model}")
@@ -57,13 +58,47 @@ class LLMClient:
         try:
             if self.config.provider == 'anthropic':
                 return await self._anthropic_request(messages, temp, tokens)
-            elif self.config.provider in ['openai', 'openrouter', 'groq', 'deepseek']:
-                return await self._openai_compatible_request(messages, temp, tokens)
+            elif self.config.provider == 'deepseek':
+                return await self._deepseek_request(messages, temp, tokens)
+            elif self.config.provider in ['openai', 'openrouter', 'groq']:
+                return await self._openai_compatible_request(messages, temp, tokens, thinking)
             else:
                 raise Exception(f"Unsupported provider: {self.config.provider}")
         except Exception as e:
             logger.error(f"❌ 🤖 Generation failed: {type(e).__name__}: {str(e)}")
             raise Exception(f"Generation failed: {e}")
+        
+    
+    async def _deepseek_request(self, messages: List[Dict[str, str]], 
+                           temperature: float, max_tokens: int) -> str:
+        """Handle Deepseek API requests"""
+        
+        
+        # API configuration
+        api_url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}"
+        }
+        
+        # Request payload
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+        
+        # Make async request
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                result = await response.json()
+                with open("debug_deepseek_response.txt", "w") as f:
+                    f.write(result['choices'][0]["message"]["reasoning_content"] or "")
+                return result["choices"][0]["message"]["content"]
+        
     
     async def _anthropic_request(self, messages: List[Dict[str, str]], 
                                temperature: float, max_tokens: int) -> str:
@@ -111,7 +146,7 @@ class LLMClient:
             return result["content"][0]["text"]
     
     async def _openai_compatible_request(self, messages: List[Dict[str, str]], 
-                                       temperature: float, max_tokens: int) -> str:
+                                       temperature: float, max_tokens: int, thinking:bool) -> str:
         """Handle OpenAI-compatible API requests"""
         
         headers = {
@@ -123,15 +158,30 @@ class LLMClient:
             headers["HTTP-Referer"] = "https://github.com/brain-heart-research"
             headers["X-Title"] = "Brain-Heart Research System"
         
-        payload = {
-            "model": self.config.model,
-            "messages": messages,
-            "provider": {
-              'sort': 'throughput'  
-            },
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
+        if thinking:
+            logger.info(f"🧠 Thinking mode enabled for {self.config.provider} model {self.config.model}")
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "provider": {
+                'sort': 'throughput'
+                },
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "reasoning": {
+                    "max_tokens": 2000
+                }
+            }
+        else:
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "provider": {
+                'sort': 'throughput'
+                },
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
         
         if hasattr(self.config, 'base_url') and self.config.base_url:
             url = f"{self.config.base_url}/chat/completions"
