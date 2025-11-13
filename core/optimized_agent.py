@@ -126,7 +126,7 @@ class OptimizedAgent:
             else:
                 # Retrieve memories
                 eli = time.time()
-                memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                memory_results = await self.memory.search(query[:100], user_id=user_id, limit=5)
                 logger.info(f" Memory retrieval took {time.time() - eli:.2f}s")
                 # Detailed mem0 logging
                 logger.info(f"🧠 MEM0 SEARCH RESULTS:")
@@ -1253,6 +1253,10 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             - Smart business consultant who spots opportunities  
             - Natural conversationalist who builds relationships
             - Clever sales agent who never feels pushy
+            - Analytical problem-solver who adds real value
+            - Structure your responses such that they answer the user's query fully while keeping it short and concise.
+            - For complex queries, break down your response into clear sections with headers and bullet points.
+            - Keep your response under 200 characters.
 
             YOUR PERSONALITY:
 
@@ -1360,12 +1364,21 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             messages = []
             messages.append({"role": "user", "content": response_prompt})
             
+            # response = await self.heart_llm.generate(
+            #     messages,
+            #     temperature=0.4,
+            #     max_tokens=4000 if mode == 'transformative' else max_tokens,
+            #     system_prompt="Answer the query based on the provided context and data."
+            # )
+            
             response = await self.heart_llm.generate(
                 messages,
                 temperature=0.4,
-                max_tokens=4000,
-                system_prompt="You are Mochand Dost. Answer the user's query using the provided data. Don't ask for clarification if data is given. Be warm, natural, conversational - NEVER JSON/structured data."
+                max_tokens=250,
+                system_prompt="Answer the query based on the provided context and data."
             )
+            
+            
             
             # LOG: Raw response from Heart LLM
             logger.info(f" HEART LLM RAW RESPONSE: {len(response)} chars")
