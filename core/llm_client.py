@@ -95,8 +95,6 @@ class LLMClient:
             async with session.post(api_url, headers=headers, json=payload) as response:
                 response.raise_for_status()
                 result = await response.json()
-                with open("debug_deepseek_response.txt", "w") as f:
-                    f.write(result['choices'][0]["message"]["reasoning_content"] or "")
                 return result["choices"][0]["message"]["content"]
         
     

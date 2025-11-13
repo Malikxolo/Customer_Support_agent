@@ -43,46 +43,15 @@ config = MemoryConfig(
 
 logger = logging.getLogger(__name__)
 
-# SYSTEM_PROMPT="""You are an expert analyst. Analyze queries using multi-signal intelligence covering semantics,
-# business opportunities, tool needs, and communication strategy. 
-
-# Your analysis must also demonstrate contextual intelligence — infer user intent, constraints, and emotional tone,
-# even if not explicitly stated.
-
-# Expand reasoning scope intelligently:
-# - Identify the user’s true problem or need beyond the literal query.
-# - Infer constraints such as budget, environment, urgency, or effort tolerance.
-# - Suggest adjacent or alternative solution paths when relevant. 
-#   (Example: If a user asks for "best AC on a tight budget", include air coolers or energy-efficient models.)
-# - When presenting solutions, prioritize durability, accessibility, and practicality.
-# - Briefly explain the reasoning or trade-off behind your choices, maintaining a natural and helpful tone.
-
-# Behavioral principles:
-# 1. Curate, not list — provide reasoned, context-fitting answers rather than raw data.
-# 2. Maintain an empathetic, peer-like tone — guide the user thoughtfully, not mechanically.
-# 3. Adapt dynamically — balance between precision and user-centered flexibility.
-# 4. Never invent irrelevant information, but always consider meaningful adjacent options.
-# 5. Your reasoning framework:
-#    - What is the user's real goal or constraint?
-#    - What related domains or solutions could address it better?
-#    - How do I present this insight clearly, within structured output?
-
-# Output Format:
-# - Return valid JSON only.
-
-# Your mission: combine analytical precision with contextual empathy — deliver responses that are not only correct,
-# but *relevant, human, and insightful*.
-# """
-
 
 
 class OptimizedAgent:
     """Single-pass agent that minimizes LLM calls while maintaining all functionality"""
     
     def __init__(self, brain_llm, heart_llm, tool_manager, router_llm=None):
-        self.brain_llm = brain_llm  # Qwen CoT for complex analysis
-        self.heart_llm = heart_llm  # Llama for response generation
-        self.router_llm = router_llm if router_llm else heart_llm  # Dedicated router or fallback to heart
+        self.brain_llm = brain_llm
+        self.heart_llm = heart_llm
+        self.router_llm = router_llm if router_llm else heart_llm
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
         self.memory = AsyncMemory(config)
@@ -1381,17 +1350,10 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             messages = []
             messages.append({"role": "user", "content": response_prompt})
             
-            # response = await self.heart_llm.generate(
-            #     messages,
-            #     temperature=0.4,
-            #     max_tokens=4000 if mode == 'transformative' else max_tokens,
-            #     system_prompt="Answer the query based on the provided context and data."
-            # )
-            
             response = await self.heart_llm.generate(
                 messages,
                 temperature=0.4,
-                max_tokens=250,
+                max_tokens=4000 if mode == 'transformative' else max_tokens,
                 system_prompt="Answer the query based on the provided context and data."
             )
             
