@@ -51,7 +51,7 @@ def upload_local_files(user_id: str, collection_name: str, file_paths: list[str]
     Returns:
         dict: The JSON response from the server.
     """
-    url = "http://localhost:8030/api/collections/create/local"
+    url = "http://localhost:8020/api/collections/create/local"
 
     
     form_data = {
@@ -80,7 +80,7 @@ def upload_local_files(user_id: str, collection_name: str, file_paths: list[str]
 
 
 async def mog_query(user_id: str, chat_history:List, query: str):
-    url = "http://localhost:8030/api/chat"
+    url = "http://localhost:8020/api/chat"
     headers = {
         "accept": "application/json",
         "Content-Type": "application/json"
@@ -834,18 +834,19 @@ def initialize_config():
         return {"status": "error", "error": str(e)}
 
 
-async def create_agents_async(config, brain_agent_config, heart_agent_config, web_model_config, use_premium_search=False):
+async def create_agents_async(config, brain_agent_config, heart_agent_config, router_agent_config, web_model_config, use_premium_search=False):
     """Create Optimized Agent with selected models"""
     try:
-        # Create LLM clients (use same config for both brain and heart)
+        # Create LLM clients
         brain_llm = LLMClient(brain_agent_config)
         heart_llm = LLMClient(heart_agent_config)
+        router_llm = LLMClient(router_agent_config)
         
         # Create tool manager
         tool_manager = ToolManager(config, brain_llm, web_model_config, use_premium_search)
         
-        # Create optimized agent (uses same LLM for both brain and heart functions)
-        optimized_agent = OptimizedAgent(brain_llm, heart_llm, tool_manager)
+        # Create optimized agent with dedicated router
+        optimized_agent = OptimizedAgent(brain_llm, heart_llm, tool_manager, router_llm)
         
         return {
             "optimized_agent": optimized_agent,
@@ -1809,8 +1810,14 @@ def main():
         # Create agents and process
         with st.spinner("Creating agents and processing query..."):
             try:
+                # Create router config using brain provider/model with minimal tokens
+                router_model_config = config.create_llm_config(
+                    provider=brain_model_config.provider,
+                    model=brain_model_config.model,
+                    max_tokens=1000
+                )
                 # Run async agent creation and processing
-                agents_result = asyncio.run(create_agents_async(config, brain_model_config, heart_model_config, web_model_config, use_premium_search))
+                agents_result = asyncio.run(create_agents_async(config, brain_model_config, heart_model_config, router_model_config, web_model_config, use_premium_search))
                 
                 if agents_result["status"] == "error":
                     st.error(f"❌ Agent creation failed: {agents_result['error']}")

@@ -375,8 +375,8 @@ class OptimizedAgent:
         routing_prompt = f"""Analyze this query and decide if it needs deep Chain-of-Thought reasoning or simple analysis.
 
 USER QUERY: {query}
-CONVERSATION CONTEXT: {context}
-MEMORIES: {memories if memories else "None"}
+LONG-TERM CONTEXT (Memories): {memories}
+CONVERSATION HISTORY: {context}
 
 Your task: Determine query complexity level.
 
@@ -455,8 +455,8 @@ Return ONLY valid JSON:
 
 USER QUERY: {query}
 DATE: {current_date}
+LONG-TERM CONTEXT (Memories): {memories}
 CONVERSATION HISTORY: {context}
-MEMORIES: {memories}
 
 Available tools:
 - web_search: Current internet information
@@ -607,7 +607,7 @@ Return ONLY valid JSON:
         """
         from datetime import datetime
         
-        context = chat_history[-2:] if chat_history else []
+        context = chat_history[-5:] if chat_history else []
         current_date = datetime.now().strftime("%B %d, %Y")
         
         analysis_prompt = f"""You are analyzing a user query for Mochan-D as of {current_date} - an AI chatbot that automates customer support across WhatsApp, Facebook, Instagram with RAG and web search capabilities.
@@ -1156,8 +1156,6 @@ Think through each question naturally, then return ONLY the JSON. No other text.
 
             (When these differ, pay attention to the original wording - it shows what the user is specifically referring to)
 
-            CONVERSATION HISTORY: {memories}
-
             CRITICAL - DATA USAGE:
             - RAG results = User's uploaded documents (PRIMARY SOURCE - use these fully)
             - WEB_SEARCH results = Current internet information
@@ -1271,9 +1269,6 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             
             AVAILABLE DATA TO USE NATURALLY:
             {tool_data}
-
-            CONVERSATION MEMORY:
-            {memories}
 
             RESPONSE REQUIREMENTS:
             - Personality: {strategy.get('personality', 'helpful_dost')}
