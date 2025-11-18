@@ -281,7 +281,7 @@ class OptimizedAgent:
             logger.info(f" ANALYSIS CACHE: {'HIT ✅' if cached_analysis else 'MISS ❌'}")
             logger.info(f" ANALYSIS PATH: {analysis_path}")
             
-            formatted_links = "\nSources:\n\n >" + "\n\n >".join(links[:3]) if links else ""
+            formatted_links = "\nSources:\n\n >" + "\n >".join(links[:3]) if links else ""
             
             return {
                 "success": True,
