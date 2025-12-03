@@ -699,7 +699,7 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
    - `zapier_*`: For external app actions (email, Slack, calendar, CRM, etc.) - only if Zapier tools available
      IMPORTANT: Zapier tools work with NATURAL LANGUAGE instructions, NOT structured params!
      Example: "Send email to john@example.com about meeting tomorrow" (natural language, NOT JSON)
-   
+     
     AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
     Select `rag` if ANY of:
     1. Any sub-task is directly ABOUT Mochan-D
@@ -708,9 +708,9 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     
     If rag should be added, add ONE `rag` to tools_to_use
  
-   IMPORTANT: The `tools_to_use` array should contain one tool for each sub-task.
-   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search", "rag"]
-   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator", "rag"]
+   TOOL COUNT RULE: The number of tools in `tools_to_use` is determined by the actual work, not by sub-task count.
+   Read the tool description - if it operates on a single item (e.g., "Adds a row", "Sends an email", "Creates a record"), 
+   and user has N items to process, include that tool N times in the array.
 
    Use NO tools for:
    - Greetings, casual chat
@@ -970,6 +970,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    - Example: "Send email to john@example.com with subject 'Meeting Tomorrow' and body 'Let's discuss the project'"
    - Zapier AI extracts the params from your instructions automatically
 
+
 6. TOOL ORCHESTRATION - CAN DIFFERENT TOOLS RUN TOGETHER?
    
    Think about dependencies BETWEEN tool types (not within same tool type):
@@ -983,7 +984,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    Default to PARALLEL unless there's a clear logical dependency.
    
    Note: All web_search queries always run parallel among themselves.
-   This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
+   This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator ↔ zapier_*)
 
 7. HOW SHOULD THE RESPONSE FEEL?
    Based on the user's tone and needs:

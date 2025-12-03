@@ -566,12 +566,13 @@ class StreamableHTTPTransport(MCPTransport):
                     return mcp_response
                     
             except asyncio.TimeoutError:
+                # IMPORTANT: Timeout doesn't mean failure! The request may have succeeded.
+                # For write operations (INSERT, UPDATE, DELETE, SEND), retrying could cause duplicates.
+                # Therefore, we do NOT retry on timeout - safer to report the timeout and let user retry manually.
                 last_error = asyncio.TimeoutError(f"Request timed out after {self.timeout}s")
-                if attempt < self.max_retries:
-                    delay = self._calculate_backoff(attempt)
-                    logger.warning(f"⚠️ Timeout, retrying in {delay:.1f}s")
-                    await asyncio.sleep(delay)
-                    continue
+                logger.warning(f"⚠️ Timeout occurred - NOT retrying (request may have succeeded)")
+                # Don't retry on timeout - break out of retry loop
+                break
                     
             except ClientError as e:
                 last_error = e

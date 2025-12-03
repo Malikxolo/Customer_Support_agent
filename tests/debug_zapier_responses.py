@@ -1,10 +1,10 @@
 """
-Debug test for Zapier tool execution and response handling.
+Interactive Debug test for Zapier tool execution and response handling.
 
-Tests three scenarios:
-1. Email with valid address - should succeed
-2. Email without address - should get clarification question
-3. Query for non-existent tool - should handle gracefully
+Run this file and type queries interactively to test the agent.
+Type 'quit' or 'exit' to stop.
+Type 'tools' to see available tools.
+Type 'clear' to clear chat history.
 """
 
 import asyncio
@@ -24,10 +24,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def test_zapier_scenarios():
-    """Test various Zapier scenarios to debug response handling."""
+async def interactive_zapier_test():
+    """Interactive test for Zapier scenarios."""
     print("=" * 70)
-    print("ZAPIER RESPONSE HANDLING DEBUG")
+    print("INTERACTIVE ZAPIER DEBUG")
+    print("=" * 70)
+    print("Commands:")
+    print("  - Type your query to test")
+    print("  - 'tools' - Show available tools with descriptions")
+    print("  - 'clear' - Clear chat history")
+    print("  - 'quit' or 'exit' - Exit")
     print("=" * 70)
     
     from core.config import Config
@@ -40,16 +46,15 @@ async def test_zapier_scenarios():
     providers = config.get_available_providers()
     
     if "openrouter" not in providers:
-        print("X OpenRouter not configured")
+        print("❌ OpenRouter not configured")
         return
     
-    # Use models from .env - Brain: nvidia/llama-3.3-nemotron-super-49b-v1.5
+    # Use models from .env
     brain_model = os.getenv("BRAIN_LLM_MODEL", "nvidia/llama-3.3-nemotron-super-49b-v1.5")
     heart_model = os.getenv("HEART_LLM_MODEL", "meta-llama/llama-4-maverick")
     
-    print(f"[CONFIG] Brain Model: {brain_model}")
+    print(f"\n[CONFIG] Brain Model: {brain_model}")
     print(f"[CONFIG] Heart Model: {heart_model}")
-    print(f"[CONFIG] Language Detection Enabled: {config.language_detection_enabled}")
     
     brain_config = config.create_llm_config("openrouter", brain_model)
     heart_config = config.create_llm_config("openrouter", heart_model)
@@ -80,7 +85,7 @@ async def test_zapier_scenarios():
             language_detector_llm = LLMClient(lang_detect_config)
             print(f"[CONFIG] Language Detector: {config.language_detection_provider}/{config.language_detection_model} ✅")
         except Exception as e:
-            print(f"[CONFIG] Language detection initialization failed: {e}. Continuing without language detection.")
+            print(f"[CONFIG] Language detection initialization failed: {e}")
             language_detector_llm = None
     
     tool_manager = ToolManager(config, heart_llm)
@@ -91,83 +96,115 @@ async def test_zapier_scenarios():
         brain_llm=brain_llm,
         heart_llm=heart_llm,
         tool_manager=tool_manager,
-        router_llm=None,  # No routing layer for this test
+        router_llm=None,
         indic_llm=indic_llm,
         language_detector_llm=language_detector_llm
     )
     
     print(f"\n[TOOLS] Available Tools: {agent.available_tools}")
-    print(f"[ZAPIER] Zapier Tools: {tool_manager.get_zapier_tools()}")
     
-    # Test scenarios - Using unique messages to bypass cache
-    import random
-    unique_id = random.randint(1000, 9999)
+    # Show Zapier tools with descriptions
+    zapier_tools = tool_manager.get_zapier_tools()
+    print(f"\n[ZAPIER] {len(zapier_tools)} Zapier Tools Available:")
+    if tool_manager._zapier_manager:
+        for tool_name in zapier_tools:
+            schema = tool_manager._zapier_manager._tool_schemas.get(tool_name, {})
+            desc = schema.get('description', 'No description')[:80]
+            print(f"   • {tool_name}: {desc}...")
     
-    test_cases = [
-        # {
-        #     "name": "1 - Valid Email with Address",
-        #     "query": f"Send an email to faizanmalik185@gmail.com ,aakashisjesus@gmail.com,tiwarianmol173@gmail.com and vasthana@foodnests.com with subject 'NL Test {unique_id}' and body 'Testing natural language instructions {unique_id}'",
-        #     "expected": "Should succeed and send email"
-        # },
-        # {
-        #     "name": "4 - Google Calendar: Create Event",
-        #     "tool": "Google Calendar",
-        #     "query": f"Create a calendar event for tomorrow at 2 PM titled 'Team Meeting {unique_id}' for 1 hour",
-        #     "expected": "Should create calendar event",
-        #     "note": "Enable: Google Calendar - Create Detailed Event action"
-        # }
-        {
-            "name": "2 - Microsoft Excel: Create Workbook and Add Row",
-            "tool": "Microsoft Excel",
-            "query": f"Create a new Microsoft Excel workbook named 'Sales Report {unique_id}' and then add a row with Name='John Doe', Amount=5000, Date='2025-11-28'",
-            "expected": "Should create Excel workbook and add row",
-            "note": "Enable: Microsoft Excel create workbook and add row to table"
-        },
-    ]
+    # Chat history for conversation context
+    chat_history = []
     
-    for test in test_cases:
-        print(f"\n{'='*70}")
-        print(f"TEST: {test['name']}")
-        print(f"Query: {test['query']}")
-        print(f"Expected: {test['expected']}")
-        print("=" * 70)
-        
+    print("\n" + "=" * 70)
+    print("Ready! Type your query below:")
+    print("=" * 70 + "\n")
+    
+    while True:
         try:
-            # Use source="whatsapp" to use simple analysis (no routing layer)
+            # Get user input
+            user_input = input("\n🧑 YOU: ").strip()
+            
+            if not user_input:
+                continue
+            
+            # Handle commands
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                print("\n👋 Exiting...")
+                break
+            
+            if user_input.lower() == 'clear':
+                chat_history = []
+                print("✅ Chat history cleared!")
+                continue
+            
+            if user_input.lower() == 'tools':
+                print("\n📋 AVAILABLE TOOLS WITH DESCRIPTIONS:")
+                print("-" * 60)
+                if tool_manager._zapier_manager:
+                    for tool_name in zapier_tools:
+                        schema = tool_manager._zapier_manager._tool_schemas.get(tool_name, {})
+                        desc = schema.get('description', 'No description')
+                        app = schema.get('app', 'Unknown')
+                        action = schema.get('action', 'Unknown')
+                        print(f"\n🔧 {tool_name}")
+                        print(f"   App: {app}")
+                        print(f"   Action: {action}")
+                        print(f"   Description: {desc}")
+                print("-" * 60)
+                continue
+            
+            if user_input.lower() == 'history':
+                print("\n📜 CHAT HISTORY:")
+                for i, msg in enumerate(chat_history):
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')[:100]
+                    print(f"   [{i+1}] {role}: {content}...")
+                continue
+            
+            # Process query
+            print("\n⏳ Processing...")
+            
             result = await agent.process_query(
-                query=test['query'],
-                chat_history=[],
+                query=user_input,
+                chat_history=chat_history,
                 user_id="test_debug",
                 source="whatsapp"
             )
             
-            print(f"\n[RESULT]:")
-            print(f"   Response: {result.get('response', 'NO RESPONSE')[:300]}...")
-            print(f"   Tools Used: {result.get('tools_used', [])}")
-            
-            # Show tool results in detail
+            # Get response
+            response = result.get('response', 'NO RESPONSE')
+            tools_used = result.get('tools_used', [])
             tool_results = result.get('tool_results', {})
-            if tool_results:
-                print(f"\n   [TOOL RESULTS]:")
-                for tool_name, tool_result in tool_results.items():
-                    print(f"      Tool: {tool_name}")
-                    if isinstance(tool_result, dict):
-                        print(f"         success: {tool_result.get('success')}")
-                        print(f"         error: {tool_result.get('error', 'None')}")
-                        print(f"         needs_clarification: {tool_result.get('needs_clarification', False)}")
-                        if 'result' in tool_result:
-                            result_preview = str(tool_result['result'])[:200]
-                            print(f"         result: {result_preview}...")
-                    else:
-                        print(f"         raw: {str(tool_result)[:200]}")
             
+            # Print response
+            print(f"\n🤖 BOT: {response}")
+            
+            # Print tool info
+            if tools_used:
+                print(f"\n   📦 Tools Used: {tools_used}")
+                
+                for tool_name, tool_result in tool_results.items():
+                    if isinstance(tool_result, dict):
+                        success = tool_result.get('success', False)
+                        error = tool_result.get('error')
+                        status = "✅" if success else "❌"
+                        print(f"   {status} {tool_name}: {'Success' if success else error}")
+            
+            # Update chat history
+            chat_history.append({"role": "user", "content": user_input})
+            chat_history.append({"role": "assistant", "content": response})
+            
+            # Keep history manageable
+            if len(chat_history) > 20:
+                chat_history = chat_history[-20:]
+                
+        except KeyboardInterrupt:
+            print("\n\n👋 Interrupted! Exiting...")
+            break
         except Exception as e:
-            print(f"\n[ERROR]: {type(e).__name__}: {e}")
+            print(f"\n❌ Error: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-        
-        # Small delay between tests
-        await asyncio.sleep(2)
     
     # Cleanup
     print("\n[CLEANUP] Cleaning up...")
@@ -181,9 +218,9 @@ async def test_zapier_scenarios():
         await tool_manager._zapier_manager.close()
     
     print("\n" + "=" * 70)
-    print("DEBUG TEST COMPLETE")
+    print("DEBUG SESSION COMPLETE")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    asyncio.run(test_zapier_scenarios())
+    asyncio.run(interactive_zapier_test())

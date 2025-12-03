@@ -250,8 +250,8 @@ class ZapierMCPClient:
     def __init__(
         self,
         security_manager: MCPSecurityManager,
-        timeout: int = 30,
-        max_retries: int = 3,
+        timeout: int = 60,  # Increased from 30 - Zapier operations can be slow
+        max_retries: int = 2,  # Reduced from 3 - retrying write ops is dangerous
         cache_tools: bool = True,
         tool_cache_ttl: int = 300
     ):
