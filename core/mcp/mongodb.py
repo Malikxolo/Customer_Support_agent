@@ -383,6 +383,9 @@ class MongoDBMCPClient:
         """
         Generate tools description for LLM prompts.
         
+        Same format as Zapier tools in OptimizedAgent - includes tool names,
+        descriptions, and parameter info so LLM can generate correct queries.
+        
         Returns:
             Formatted string describing available MongoDB tools
         """
@@ -390,45 +393,38 @@ class MongoDBMCPClient:
             return ""
         
         lines = [
-            "## MongoDB Database Tools (via MCP)",
+            "## MongoDB Database Tools",
             "",
-            "The following MongoDB operations are available:",
+            "Available MongoDB operations (use exact tool names):",
             ""
         ]
         
-        # Group tools by type
-        read_tools = []
-        write_tools = []
-        schema_tools = []
-        
         for name, tool in self._tools.items():
-            if name in ["find", "aggregate", "count", "countDocuments"]:
-                read_tools.append(tool)
-            elif name in ["insertOne", "insertMany", "updateOne", "updateMany", "deleteOne", "deleteMany"]:
-                write_tools.append(tool)
-            else:
-                schema_tools.append(tool)
-        
-        if read_tools:
-            lines.append("### Read Operations")
-            for tool in read_tools:
-                desc = tool.description[:100] if tool.description else tool.name
-                lines.append(f"- **{tool.name}**: {desc}")
+            desc = tool.description[:150] if tool.description else name
+            
+            # Get parameter info from schema
+            schema = tool.input_schema or {}
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+            
+            # Format parameters
+            params_parts = []
+            for param_name, param_info in properties.items():
+                param_type = param_info.get("type", "any")
+                is_req = "*" if param_name in required else ""
+                params_parts.append(f"{param_name}{is_req}:{param_type}")
+            
+            params_str = ", ".join(params_parts) if params_parts else "no params"
+            
+            lines.append(f"- **{name}**: {desc}")
+            lines.append(f"  Params: {params_str}")
             lines.append("")
         
-        if write_tools:
-            lines.append("### Write Operations")
-            for tool in write_tools:
-                desc = tool.description[:100] if tool.description else tool.name
-                lines.append(f"- **{tool.name}**: {desc}")
-            lines.append("")
-        
-        if schema_tools:
-            lines.append("### Schema/Admin Operations")
-            for tool in schema_tools:
-                desc = tool.description[:100] if tool.description else tool.name
-                lines.append(f"- **{tool.name}**: {desc}")
-            lines.append("")
+        # Add important notes
+        lines.append("NOTES:")
+        lines.append("- * = required parameter")
+        lines.append("- documents must be objects like {\"name\": \"value\"}")
+        lines.append("- filter uses MongoDB query syntax like {\"field\": \"value\"}")
         
         return "\n".join(lines)
     

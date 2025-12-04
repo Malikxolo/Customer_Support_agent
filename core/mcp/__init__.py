@@ -92,6 +92,13 @@ from .mongodb import (
     MongoDBToolResult
 )
 
+# Query Agent (Universal NoSQL)
+from .query_agent import (
+    QueryAgent,
+    QueryResult,
+    LLMConfig
+)
+
 __all__ = [
     # Exceptions
     "MCPError",
@@ -133,7 +140,12 @@ __all__ = [
     "MongoDBMCPClient",
     "MongoDBToolManager",
     "MongoDBTool",
-    "MongoDBToolResult"
+    "MongoDBToolResult",
+    
+    # Query Agent
+    "QueryAgent",
+    "QueryResult",
+    "LLMConfig"
 ]
 
 # Version
