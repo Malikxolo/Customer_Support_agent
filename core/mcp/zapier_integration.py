@@ -1047,7 +1047,7 @@ def get_zapier_tools_prompt(tool_manager: ZapierToolManager, max_tools: int = 20
                 break
             
             name = tool["name"]
-            desc = tool["description"][:80] if tool["description"] else tool["display_name"]
+            desc = tool["description"] if tool["description"] else tool["display_name"]
             required = tool.get("required", [])
             
             lines.append(f"  - {name}: {desc}")

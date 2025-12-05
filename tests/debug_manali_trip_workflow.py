@@ -131,7 +131,7 @@ async def test_manali_trip_workflow():
     # ========================================
     # QUERY 1: Plan for Manali trip
     # ========================================
-    query1 = "Make a plan for 6 person 3 days 2 night budget plan for manali tirp"
+    query1 = "Make a plan for 6 person 3 days 2 night budget plan for a kashmir trippp"
     
     print("\n" + "=" * 80)
     print(f"QUERY 1: {query1}")
@@ -159,7 +159,7 @@ async def test_manali_trip_workflow():
     # ========================================
     # QUERY 2: Add to Google Sheets
     # ========================================
-    query2 = "Okay add these details in google sheets and named that sheet as 'Manali trips planning'okay?"
+    query2 = "Okay add these details in google sheets and named that sheet as 'kashmir's trip planning'okayys?"
     
     print("\n" + "=" * 80)
     print(f"QUERY 2: {query2}")

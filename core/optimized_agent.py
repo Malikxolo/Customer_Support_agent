@@ -83,17 +83,11 @@ class OptimizedAgent:
         
         if self._mongodb_available:
             base_tools += """
-- mongodb: Database operations (query, insert, update, delete documents in MongoDB)
-  Use when: User wants to store data, retrieve records, update database entries, or delete data
-  Examples: "add user to database", "find all orders", "update customer email", "delete old records"
-  IMPORTANT: Provide natural language instruction - the system will convert it to database query"""
+- mongodb: MongoDB database operations"""
         
         if self._redis_available:
             base_tools += """
-- redis: Key-value store operations (set, get, hashes, lists, sets, sorted sets, streams)
-  Use when: User wants to cache data, store session info, manage queues, pub/sub, or fast key-value operations
-  Examples: "store user session", "cache this data", "add to queue", "get value for key", "increment counter"
-  IMPORTANT: Provide natural language instruction - the system will convert it to Redis command"""
+- redis: Redis database operations"""
         
         if self._zapier_available:
             # Get dynamic prompt with ALL Zapier tools (universal - auto-updates)
@@ -718,9 +712,12 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
    GENERAL TOOL SELECTION:
    - `web_search`: For current information, prices, comparisons, weather, news, etc.
    - `calculator`: For mathematical calculations, statistical operations
+   - `mongodb`: ONLY when user EXPLICITLY mentions MongoDB,mongodb.
+   - `redis`: ONLY when user EXPLICITLY mentions Redis, redisdb.
    - `zapier_*`: For external app actions (email, Slack, calendar, CRM, etc.) - only if Zapier tools available
-     IMPORTANT: Zapier tools work with NATURAL LANGUAGE instructions, NOT structured params!
-     Example: "Send email to john@example.com about meeting tomorrow" (natural language, NOT JSON)
+   
+   IMPORTANT: All MCP tools (zapier_*, mongodb, redis) work with NATURAL LANGUAGE instructions, NOT structured params!
+   Example: "Send email to john@example.com about meeting tomorrow" (natural language, NOT JSON)
      
     AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
     Select `rag` if ANY of:
@@ -760,16 +757,20 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     
     For SEQUENTIAL mode:
     - ONLY the first indexed tool (position 0) gets a real query
-    - ALL subsequent tools get "WAIT_FOR_PREVIOUS"
+    - ALL other tools: MUST use exactly "WAIT_FOR_PREVIOUS" as their query string
     - Example: `rag_0`: "Mochan-D features", `web_search_0`: "WAIT_FOR_PREVIOUS"
     
     Query optimization rules:
     - RAG: "Mochan-D" + [specific topic from sub-task]
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
-    - Zapier_*: Write NATURAL LANGUAGE instructions describing the action (e.g., "Send email to john@example.com with subject 'Meeting' and body 'See you tomorrow'")
+    - `zapier_*`, `mongodb`, `redis`: External actions - Use NATURAL LANGUAGE instructions
+        Example: "Send email to john@example.com with subject 'Meeting'"
+        Example: "Insert user John Doe with email john@example.com into users collection"
+        Example: "Set cache key user:123 to value 'active' with 1 hour expiration"
     
-   Note: All web_search queries always run parallel among themselves.
+    Note: All web_search queries always run parallel among themselves.
+    MCP tools (zapier_*, mongodb, redis) use natural language instructions.
    This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
 
 7. Is this a follow-up query?
@@ -1279,6 +1280,16 @@ Think through each question naturally, then return ONLY the JSON. No other text.
                     for item in result['results'][:3]:
                         if 'snippet' in item:
                             previous_data.append(f"{tool_name.upper()}: {item['snippet']}")
+                # Handle MCP tool results (Zapier, MongoDB, Redis, etc.)
+                elif 'result' in result:
+                    result_data = result['result']
+                    if isinstance(result_data, str):
+                        previous_data.append(f"{tool_name.upper()} result: {result_data[:1000]}")
+                    elif isinstance(result_data, dict):
+                        previous_data.append(f"{tool_name.upper()} result: {str(result_data)[:1000]}")
+                # Also check for success/error pattern
+                elif result.get('success') and 'tool' in result:
+                    previous_data.append(f"{tool_name.upper()} completed successfully: {str(result)[:1000]}")
         
         previous_summary = "\n".join(previous_data) if previous_data else "No data from previous tools"
         
@@ -1321,6 +1332,39 @@ Think through each question naturally, then return ONLY the JSON. No other text.
 
         Return ONLY a valid math expression. If you cannot determine what to calculate, return "SKIP"."""
 
+        # SPECIAL HANDLING FOR MCP TOOLS (Zapier, MongoDB, Redis, PostgreSQL, etc.)
+        elif next_tool.startswith("zapier_") or next_tool in ["mongodb", "redis", "postgresql"]:
+            middleware_prompt = f"""Generate a natural language instruction for an MCP tool action.
+
+ORIGINAL USER QUERY: {original_query}
+
+PREVIOUS TOOL RESULTS:
+{previous_summary}
+
+YOUR TASK:
+1. Read the previous tool results to understand what was created/found
+2. Extract key identifiers (spreadsheet name, document ID, database name, collection name, etc.)
+3. Generate a natural language instruction that includes these identifiers
+
+RULES:
+- Include the resource name/ID from previous results in your instruction
+- Be specific about WHICH resource to operate on
+- Include all data that needs to be added/updated
+
+EXAMPLES:
+Previous: "Created spreadsheet 'Budget Plan' with ID xyz123"
+Query: "add budget data"
+Output: Add a row to the spreadsheet 'Budget Plan' with the budget data: Item1: $100, Item2: $200
+
+Previous: "Created document 'Meeting Notes'"
+Query: "add the summary"
+Output: Add the meeting summary to the document 'Meeting Notes': Key points discussed...
+
+Previous: "Connected to database 'customers'"
+Query: "find user john"
+Output: Find user with name 'john' in the customers database
+
+Return ONLY the natural language instruction. Be specific about which resource to use."""
         
         else:
             middleware_prompt = f"""You are a query generator. Analyze the previous results and create the NEXT search query.
