@@ -62,6 +62,7 @@ class GrievanceAgent:
         # Backend URL for posting grievances
         self.backend_url = getenv("GRIEVANCE_BACKEND_URL")
         self.resolve_ward_url = getenv("RESOLVE_WARD")
+        self.resolve_ward_url = getenv("RESOLVE_WARD")
         
         logger.info(f"✅ GrievanceAgent initialized")
         logger.info(f"   Available tools: {self.available_tools}")
@@ -588,7 +589,7 @@ Examples:
                     results[tool_name] = {"error": str(e)}
         
         return results
-
+    
     async def _resolve_ward_from_location(self, address: str, city: str) -> Optional[str]:
         """Resolve ward number from location using RAG tool"""
         try:
