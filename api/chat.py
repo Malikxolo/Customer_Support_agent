@@ -52,7 +52,8 @@ from core import (
     LLMClient,
     ToolManager, Config
 )
-from core.grievance_agent import GrievanceAgent as DMGrievanceAgent
+from core.cs_tools import ToolManager as CSToolManager
+from core.customer_support_agent import CustomerSupportAgent
 from core.logging_security import (
     safe_log_response,
     safe_log_user_data,
@@ -237,23 +238,19 @@ async def lifespan(app: FastAPI):
             logging.warning(f"⚠️ Language detection initialization failed: {e}. Continuing without language detection.")
             language_detector_llm = None
 
-    # Create GrievanceAgent (only agent for this version)
+    # Create CustomerSupportAgent (only agent for this version)
     global agent
-    logging.info("🏛️ Creating GrievanceAgent (DM Office mode)")
+    logging.info("📞 Creating CustomerSupportAgent")
     
-    grievance_agent_config = config.create_llm_config(
-        provider=settings.grievance_agent_provider,
-        model=settings.grievance_agent_model,
-        max_tokens=4000
-    )
-    grievance_agent_llm = LLMClient(grievance_agent_config)
+    # CustomerSupportAgent uses CSToolManager (simple initialization, no params needed)
+    cs_tool_manager = CSToolManager()
     
-    agent = DMGrievanceAgent(
-        llm=grievance_agent_llm,
-        tool_manager=tool_manager,
-        language_detector_llm=language_detector_llm
+    agent = CustomerSupportAgent(
+        brain_llm=brain_llm,
+        heart_llm=heart_llm,
+        tool_manager=cs_tool_manager
     )
-    logging.info(f"✅ GrievanceAgent initialized with model: {settings.grievance_agent_model}")
+    logging.info("✅ CustomerSupportAgent initialized")
     
     # Initialize Organization Manager
     mongo_client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'))
@@ -286,7 +283,7 @@ async def lifespan(app: FastAPI):
     agent.worker_task = asyncio.create_task(
         agent.background_task_worker()
     )
-    logging.info("GrievanceAgent background worker started")
+    logging.info("CustomerSupportAgent background worker started")
 
     try:
         yield
@@ -372,7 +369,7 @@ async def set_brain_heart_agents(request: UpdateAgentsRequest):
 
 @router.post("/chat", dependencies=[Depends(RateLimiter(times=6, seconds=60))])
 async def chat_brain_heart_system(request: ChatMessage = Body(...)):
-    """Chat endpoint - uses GrievanceAgent"""
+    """Chat endpoint - uses CustomerSupportAgent"""
     
     try:
         user_id = request.userid

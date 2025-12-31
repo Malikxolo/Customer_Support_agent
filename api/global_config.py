@@ -15,8 +15,7 @@ class BrainHeartSettings:
                  sales_response_provider: Optional[str], sales_response_model: Optional[str],
                  grievance_provider: Optional[str], grievance_model: Optional[str],
                  query_agent_provider: Optional[str], query_agent_model: Optional[str],
-                 use_premium_search: bool, web_model: Optional[str],
-                 grievance_agent_provider: Optional[str], grievance_agent_model: Optional[str]):
+                 use_premium_search: bool, web_model: Optional[str]):
         self.brain_provider = brain_provider
         self.brain_model = brain_model
         self.heart_provider = heart_provider
@@ -39,8 +38,6 @@ class BrainHeartSettings:
         self.query_agent_model = query_agent_model
         self.use_premium_search = use_premium_search
         self.web_model = web_model
-        self.grievance_agent_provider = grievance_agent_provider
-        self.grievance_agent_model = grievance_agent_model
 
 settings = BrainHeartSettings(
     brain_provider=os.getenv('BRAIN_LLM_PROVIDER'),
@@ -64,7 +61,5 @@ settings = BrainHeartSettings(
     query_agent_provider=os.getenv('QUERY_AGENT_LLM_PROVIDER'),
     query_agent_model=os.getenv('QUERY_AGENT_LLM_MODEL'),
     use_premium_search=os.getenv('USE_PREMIUM_SEARCH', 'false').lower() == 'true',
-    web_model=os.getenv('WEB_MODEL', None),
-    grievance_agent_provider=os.getenv('GRIEVANCE_AGENT_PROVIDER', 'openrouter'),
-    grievance_agent_model=os.getenv('GRIEVANCE_AGENT_MODEL', 'meta-llama/llama-3.3-70b-instruct')
+    web_model=os.getenv('WEB_MODEL', None)
 )
