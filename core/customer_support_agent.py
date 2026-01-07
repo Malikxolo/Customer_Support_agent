@@ -67,13 +67,14 @@ class CustomerSupportAgent:
                 "returns": "damage assessment, severity, recommendation"
             },
             "order_action": {
-                "purpose": "Process refund, cancel, replace, generate return label",
-                "use_when": "After verification passes with low/medium risk",
-                "important": "Always use verification tool FIRST before this"
+                "purpose": "DO NOT USE - Bot cannot process refunds/cancels/replacements",
+                "use_when": "NEVER - these actions require human agent approval",
+                "important": "Always escalate to assign_agent for refund/cancel/replace requests"
             },
             "assign_agent": {
-                "purpose": "Escalate to human agent for immediate help",
-                "use_when": "Very frustrated customer, urgent/complex issue, high fraud risk, customer requests human, sensitive operations after verification"
+                "purpose": "Connect customer with a human agent who can process refunds, replacements, etc.",
+                "use_when": "After gathering all info (order ID, reason, photos if applicable) for: refund requests, cancellations, replacements, complex issues",
+                "important": "NEVER use just because user says 'talk to agent' - first ask what their issue is. Gather all info before escalating."
             },
             "raise_ticket": {
                 "purpose": "Create support ticket for investigation",
@@ -203,24 +204,52 @@ Think through these steps naturally:
 
 3. DO YOU NEED MORE INFORMATION?
    Consider if you're missing critical info to help them:
-   - For refund/cancellation → Do you have the order ID?
+   - For refund/cancellation → Do you have the order ID? What's the reason?
    - For damaged item → Do you have a photo? Do you know what happened?
    - For wrong item → Do you have a photo? What did they receive vs expect?
+   - For expired/spoiled product → Ask for photo showing expiry date or product condition
+   - For "I want to talk to agent" with NO context → Ask what issue they're facing first!
+   
+   IMPORTANT: If user just says "I want agent" or "talk to human" but hasn't explained their problem:
+   → Set needs_more_info=true, missing_info="what issue they need help with"
+   → Do NOT assign agent yet - we need to understand and try to help first
    
    If missing essential info → set needs_more_info=true and specify what's missing
 
 4. SELECT TOOLS (only if you have enough info)
    - Order status/tracking questions → live_information
    - Policy/FAQ questions → knowledge_base  
-   - Refund/cancel requests → verification first (check risk), then assign_agent for handling
-   - Damaged product with photo → image_analysis + verification + assign_agent
-   - Very frustrated or complex issue → assign_agent
+   - Refund/cancel/replace requests → verification first, then assign_agent (bot CANNOT process these, agent must)
+   - Damaged product with photo → image_analysis + verification, then OFFER agent in response (don't auto-assign)
    - Non-urgent issue needing research → raise_ticket
 
 5. SPECIAL CASES
-   - Customer explicitly asks for human → assign_agent
-   - High-risk verification result → assign_agent (not order_action)
+   - Customer asks for human BUT has already explained issue and we couldn't help → assign_agent
+   - Customer asks for human WITHOUT explaining issue → Ask what's wrong first (needs_more_info=true)
+   - High-risk verification result → assign_agent
    - Simple greeting or thanks → no tools needed
+
+=== TOOL SELECTION RULES ===
+
+Some tools are "information-gathering" and can run together:
+   - live_information, knowledge_base, verification, image_analysis
+
+Some tools are "commitment actions" - only use when you have enough verified info:
+   - assign_agent → commits a human agent's time
+   - order_action → commits to refund/cancel/replace
+   - raise_ticket → creates a permanent record
+
+IMPORTANT FOR DAMAGE CLAIMS:
+   - When customer provides photo for damage → Use [image_analysis, verification] ONLY
+   - Do NOT include assign_agent in the same turn
+   - Wait for image analysis result, then in the NEXT turn:
+     • If damage confirmed → Offer to connect with agent (response asks "would you like me to connect you with an agent?")
+     • If image error/failed → Ask for clearer photo (no agent needed yet)
+     • If no damage found → Tell user, offer escalation if they insist
+   - Only use assign_agent when:
+     • Customer confirms they want agent AFTER we offered (based on verified issue)
+     • Customer already explained issue in previous turns AND we couldn't resolve it AND they ask for human
+   - Do NOT use assign_agent just because user says "talk to agent" without explaining their problem first
 
 Return your analysis as JSON:
 
@@ -382,9 +411,24 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
    - If any tool shows "Error" or failed → acknowledge the issue
    - For image_analysis error → politely ask customer to share the image again (it may not have uploaded properly)
    - Don't pretend the tool worked if it failed
+   - IMPORTANT: If image_analysis failed, focus ONLY on getting a proper image. Do NOT offer agent connection yet.
+     Wait until image is successfully analyzed before offering to connect with an agent.
 
-6. FORMAT:
-   - Keep it concise (2-4 sentences unless explaining something complex)
+6. OFFERING ESCALATION (only if needs_more_info = False AND you have all the info):
+   When ready to escalate, give two options:
+   - Option 1: Connect with agent (for refunds, replacements, complex issues)
+   - Option 2: Just sharing feedback (no agent needed, thank them)
+   Example: "Would you like me to connect you with an agent to help with this, or were you just sharing feedback?"
+   
+   IMPORTANT: If needs_more_info = True, do NOT offer escalation yet. Just ask for the missing info.
+
+7. BOT LIMITATIONS:
+   - Bot CANNOT process refunds, cancellations, or replacements directly
+   - For these requests: gather info → verify → then offer to connect with agent
+   - Never say "I'll process the refund" - say "I can connect you with an agent who can help with your refund"
+
+8. FORMAT:
+   - Keep responses extremely short: 1 sentence for most answers within 10-20 wods. Only 2 sentences if absolutely necessary. Be direct and helpful.
    - Be warm but professional
    - End with a helpful next step or question if appropriate
    - Do NOT make up information that wasn't in the tool results
