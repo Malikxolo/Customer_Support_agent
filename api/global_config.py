@@ -15,6 +15,8 @@ class BrainHeartSettings:
                  sales_response_provider: Optional[str], sales_response_model: Optional[str],
                  grievance_provider: Optional[str], grievance_model: Optional[str],
                  query_agent_provider: Optional[str], query_agent_model: Optional[str],
+                 customer_bot_analysis_provider: Optional[str], customer_bot_analysis_model: Optional[str],
+                 customer_bot_response_provider: Optional[str], customer_bot_response_model: Optional[str],
                  use_premium_search: bool, web_model: Optional[str]):
         self.brain_provider = brain_provider
         self.brain_model = brain_model
@@ -36,6 +38,10 @@ class BrainHeartSettings:
         self.grievance_model = grievance_model
         self.query_agent_provider = query_agent_provider
         self.query_agent_model = query_agent_model
+        self.customer_bot_analysis_provider = customer_bot_analysis_provider
+        self.customer_bot_analysis_model = customer_bot_analysis_model
+        self.customer_bot_response_provider = customer_bot_response_provider
+        self.customer_bot_response_model = customer_bot_response_model
         self.use_premium_search = use_premium_search
         self.web_model = web_model
 
@@ -60,6 +66,10 @@ settings = BrainHeartSettings(
     grievance_model=os.getenv('GRIEVANCE_LLM_MODEL'),
     query_agent_provider=os.getenv('QUERY_AGENT_LLM_PROVIDER'),
     query_agent_model=os.getenv('QUERY_AGENT_LLM_MODEL'),
+    customer_bot_analysis_provider=os.getenv('CUSTOMER_BOT_ANALYSIS_LLM_PROVIDER'),
+    customer_bot_analysis_model=os.getenv('CUSTOMER_BOT_ANALYSIS_LLM_MODEL'),
+    customer_bot_response_provider=os.getenv('CUSTOMER_BOT_RESPONSE_LLM_PROVIDER'),
+    customer_bot_response_model=os.getenv('CUSTOMER_BOT_RESPONSE_LLM_MODEL'),
     use_premium_search=os.getenv('USE_PREMIUM_SEARCH', 'false').lower() == 'true',
     web_model=os.getenv('WEB_MODEL', None)
 )

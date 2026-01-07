@@ -70,6 +70,7 @@ redis
 pymongo
 pypdf2
 trafilatura
+piexif
 
 # Subprocess MCP server runtime used by redis-mcp-server (provides `uvx` CLI)
 # Install `uv` so the `uvx` command is available for Redis MCP integration.

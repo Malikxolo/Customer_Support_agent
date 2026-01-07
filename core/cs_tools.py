@@ -1,14 +1,18 @@
-"""
-Customer Support Tool System
-Boilerplate structure for support operations
-"""
-
 import asyncio
 import aiohttp
 import logging
+import os
+import base64
+import json
+import io
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from abc import ABC, abstractmethod
+from dotenv import load_dotenv
+from PIL import Image
+import piexif
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -731,7 +735,7 @@ class VerificationTool(BaseTool):
         logger.info(f"Fraud check: user={user_id}, order={order_id}, action={action}")
         
         # Placeholder implementation
-        # In production, this would call fraud detection API or check Redis counters
+        # In production, this would call fraud detection API
         return {
             "fraud_score": 0.0,  # 0.0-1.0 scale
             "risk_level": "low",  # low, medium, high
@@ -754,58 +758,86 @@ class VerificationTool(BaseTool):
 
 
 class ImageAnalysisTool(BaseTool):
-    """Analyze product images for damage, defects, or verification"""
+    """Analyze product images for damage, defects, or verification using Vision LLM"""
     
     def __init__(self, vision_api_key: str = None):
         super().__init__(
             "image_analysis",
             "Analyze product photos to verify damage, defects, or issues. Use for: broken items, defective products, wrong items delivered. Returns damage assessment and recommendation."
         )
-        self.vision_api_key = vision_api_key
+        # Config from env
+        self.api_key = vision_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.vision_model = os.getenv("VISION_MODEL", "openai/gpt-4o")
+        self.base_url = os.getenv("VISION_API_BASE_URL", "https://openrouter.ai/api/v1")
         self.session = None
         
-        logger.info("ImageAnalysisTool initialized")
+        logger.info(f"ImageAnalysisTool initialized with model: {self.vision_model}")
     
     async def execute(self, image_url: str = None, image_base64: str = None, 
-                     issue_type: str = None, query: str = None, **kwargs) -> Dict[str, Any]:
+                     issue_type: str = None, query: str = None,
+                     order_id: str = None, product_name: str = None, **kwargs) -> Dict[str, Any]:
         """
         Analyze product image
         
         Args:
-            image_url: URL to image
+            image_url: URL to image (WhatsApp/Twilio media URL)
             image_base64: Base64 encoded image
-            issue_type: Type of issue (broken, defective, wrong_item)
+            issue_type: Type of issue (broken, defective, wrong_item) - optional, auto-detected
             query: Customer's description of the issue
+            order_id: Order ID for context
+            product_name: Expected product name for comparison
         """
         self._record_usage()
-        logger.info(f"Image analysis: issue_type={issue_type}")
+        logger.info(f"Image analysis: issue_type={issue_type}, has_url={bool(image_url)}, has_base64={bool(image_base64)}")
+        
+        # Validate input
+        if not image_url and not image_base64:
+            return {
+                "success": False,
+                "error": "No image provided. Please provide either image_url or image_base64.",
+                "analysis": None
+            }
+        
+        if not self.api_key:
+            return {
+                "success": False,
+                "error": "Vision API key not configured. Set OPENROUTER_API_KEY in .env",
+                "analysis": None
+            }
         
         try:
             if not self.session:
-                self.session = aiohttp.ClientSession()
+                timeout = aiohttp.ClientTimeout(total=60)
+                self.session = aiohttp.ClientSession(timeout=timeout)
             
-            # TODO: Implement vision API call (OpenAI Vision, Claude Vision, Google Vision)
-            # Example implementation:
-            # 1. Send image to vision API
-            # 2. Analyze for damage/defects
-            # 3. Extract description and severity
-            # 4. Return structured analysis
+            # If we have URL, try to download and convert to base64
+            if image_url and not image_base64:
+                image_base64 = await self._download_image_to_base64(image_url)
+                if not image_base64:
+                    return {
+                        "success": False,
+                        "error": "Failed to download image from URL",
+                        "analysis": None
+                    }
             
-            logger.info(f"Analyzing image for: {query}")
+            # Check if image is AI-generated
+            ai_detection = self._detect_ai_generated(image_base64)
             
-            # Placeholder implementation
+            # Analyze with vision model
+            analysis = await self._analyze_with_vision(
+                image_base64=image_base64,
+                customer_query=query,
+                issue_type=issue_type,
+                product_name=product_name,
+                order_id=order_id,
+                ai_detection=ai_detection
+            )
+            
             return {
                 "success": True,
-                "analysis": {
-                    "damage_detected": True,  # PLACEHOLDER
-                    "damage_type": "physical_damage",  # PLACEHOLDER
-                    "severity": "moderate",  # low, moderate, severe
-                    "description": "Visual inspection shows potential product defect",
-                    "confidence": 0.85,
-                    "recommendation": "escalate_to_specialist"
-                },
-                "status": "PENDING_IMPLEMENTATION",
-                "message": "Image analysis not yet implemented - placeholder response"
+                "analysis": analysis,
+                "ai_detection": ai_detection,
+                "message": "Image analysis completed"
             }
             
         except Exception as e:
@@ -816,10 +848,282 @@ class ImageAnalysisTool(BaseTool):
                 "analysis": None
             }
     
+    async def _download_image_to_base64(self, image_url: str) -> Optional[str]:
+        """Download image from URL and convert to base64"""
+        try:
+            headers = {}
+            # Handle Twilio media URLs (require auth)
+            if "twilio.com" in image_url:
+                twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+                twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+                if twilio_sid and twilio_token:
+                    credentials = base64.b64encode(f"{twilio_sid}:{twilio_token}".encode()).decode()
+                    headers["Authorization"] = f"Basic {credentials}"
+            
+            async with self.session.get(image_url, headers=headers) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to download image: {response.status}")
+                    return None
+                
+                image_data = await response.read()
+                content_type = response.headers.get("Content-Type", "image/jpeg")
+                
+                # Detect media type
+                if "png" in content_type:
+                    media_type = "image/png"
+                elif "gif" in content_type:
+                    media_type = "image/gif"
+                elif "webp" in content_type:
+                    media_type = "image/webp"
+                else:
+                    media_type = "image/jpeg"
+                
+                encoded = base64.b64encode(image_data).decode("utf-8")
+                logger.info(f"Downloaded image: {len(image_data)} bytes, type: {media_type}")
+                return f"data:{media_type};base64,{encoded}"
+                
+        except Exception as e:
+            logger.error(f"Error downloading image: {str(e)}")
+            return None
+    
+    def _build_vision_prompt(self, customer_query: str = None, issue_type: str = None,
+                             product_name: str = None, order_id: str = None, 
+                             ai_detection: Dict[str, Any] = None) -> tuple:
+        """Build system and user prompts for vision analysis"""
+        
+        # Build context
+        context_parts = []
+        if customer_query:
+            context_parts.append(f"Customer's complaint: {customer_query}")
+        if product_name:
+            context_parts.append(f"Expected product: {product_name}")
+        if issue_type:
+            context_parts.append(f"Reported issue type: {issue_type}")
+        if order_id:
+            context_parts.append(f"Order ID: {order_id}")
+        if ai_detection and ai_detection.get("is_ai_generated"):
+            ai_status = "POTENTIALLY AI-GENERATED"
+            ai_confidence = ai_detection.get("confidence", 0.0)
+            ai_signals = ", ".join(ai_detection.get("signals", []))
+            context_parts.append(f"AI Detection: {ai_status} (confidence: {ai_confidence:.2f})")
+            if ai_signals:
+                context_parts.append(f"AI Detection Signals: {ai_signals}")
+        
+        context = "\n".join(context_parts) if context_parts else "No additional context provided."
+        
+        system_prompt = """You are a customer support image analyst. Analyze product images to assess damage, defects, or issues.
+
+Your job is to:
+1. Describe what you see in the image
+2. Identify any visible damage, defects, or quality issues
+3. Assess severity (none, minor, moderate, severe)
+4. Determine if the image supports the customer's claim
+5. Provide a recommendation for the support team
+
+IMPORTANT: Be objective and factual. Only report what you can actually see in the image."""
+
+        user_prompt = f"""Analyze this product image for a customer support case.
+
+{context}
+
+Please provide your analysis in the following JSON format:
+{{
+    "damage_detected": true/false,
+    "damage_type": "physical_damage" | "defect" | "wrong_item" | "quality_issue" | "missing_parts" | "no_issue",
+    "severity": "none" | "minor" | "moderate" | "severe",
+    "description": "detailed description of what you see",
+    "matches_customer_claim": true/false/null (null if no claim provided),
+    "confidence": 0.0-1.0,
+    "recommendation": "approve_refund" | "approve_replacement" | "request_more_images" | "escalate_to_human" | "deny_claim",
+    "reasoning": "explanation for your recommendation"
+}}
+
+Respond ONLY with the JSON object, no other text."""
+
+        return system_prompt, user_prompt
+    
+    def _detect_ai_generated(self, image_base64: str) -> Dict[str, Any]:
+        """
+        Detect if image is AI-generated by analyzing EXIF metadata
+        
+        Args:
+            image_base64: Base64 encoded image data
+            
+        Returns:
+            Dict with detection results
+        """
+        try:
+            # Handle data URLs (remove prefix if present)
+            if image_base64.startswith('data:'):
+                # Extract base64 data after comma
+                base64_data = image_base64.split(',', 1)[1] if ',' in image_base64 else image_base64
+            else:
+                base64_data = image_base64
+            
+            # Decode base64 to bytes
+            image_bytes = base64.b64decode(base64_data)
+            
+            # Open image with PIL
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Check EXIF metadata
+            exif_data = {}
+            if hasattr(image, '_getexif') and image._getexif():
+                exif_dict = piexif.load(image.info.get('exif', b''))
+                exif_data = exif_dict.get('0th', {})
+            
+            # AI detection signals
+            signals = []
+            confidence = 0.0
+            
+            # Signal 1: Missing EXIF metadata (common in AI-generated images)
+            if not exif_data:
+                signals.append("No EXIF metadata found")
+                confidence += 0.3
+            
+            # Signal 2: Missing camera information
+            camera_tags = [piexif.ImageIFD.Make, piexif.ImageIFD.Model]
+            has_camera_info = any(tag in exif_data for tag in camera_tags)
+            if not has_camera_info:
+                signals.append("No camera information in EXIF")
+                confidence += 0.2
+            
+            # Signal 3: Missing GPS/location data (real photos often have this)
+            gps_tags = [piexif.GPSIFD.GPSLatitude, piexif.GPSIFD.GPSLongitude]
+            has_gps = any(tag in exif_data for tag in gps_tags)
+            if not has_gps:
+                signals.append("No GPS/location data")
+                confidence += 0.1
+            
+            # Signal 4: Check for known AI software signatures
+            software = exif_data.get(piexif.ImageIFD.Software, b'').decode('utf-8', errors='ignore').lower()
+            ai_software_keywords = ['dall-e', 'midjourney', 'stable diffusion', 'ai', 'generated']
+            if any(keyword in software for keyword in ai_software_keywords):
+                signals.append(f"AI software detected: {software}")
+                confidence += 0.8
+            
+            # Signal 5: Check image dimensions (AI images often have specific ratios)
+            width, height = image.size
+            aspect_ratio = width / height
+            # Common AI image ratios
+            ai_ratios = [1.0, 1.5, 1.333, 1.777, 0.666]  # 1:1, 3:2, 4:3, 16:9, 2:3
+            if any(abs(aspect_ratio - ratio) < 0.01 for ratio in ai_ratios):
+                signals.append(f"Suspicious aspect ratio: {aspect_ratio:.3f}")
+                confidence += 0.1
+            
+            # Determine if likely AI-generated
+            is_ai_generated = confidence >= 0.5
+            
+            return {
+                "is_ai_generated": is_ai_generated,
+                "confidence": confidence,
+                "signals": signals,
+                "exif_present": bool(exif_data),
+                "has_camera_info": has_camera_info,
+                "has_gps": has_gps,
+                "software": software,
+                "dimensions": f"{width}x{height}",
+                "aspect_ratio": aspect_ratio
+            }
+            
+        except Exception as e:
+            logger.warning(f"AI detection failed: {str(e)}")
+            return {
+                "is_ai_generated": False,  # Default to not AI if detection fails
+                "confidence": 0.0,
+                "signals": [f"Detection failed: {str(e)}"],
+                "error": str(e)
+            }
+    
+    async def _analyze_with_vision(self, image_base64: str, customer_query: str = None,
+                                   issue_type: str = None, product_name: str = None,
+                                   order_id: str = None, ai_detection: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Send image to vision model for analysis"""
+        
+        system_prompt, user_prompt = self._build_vision_prompt(
+            customer_query, issue_type, product_name, order_id, ai_detection
+        )
+        
+        # Build message with image content
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_base64 if image_base64.startswith("data:") else f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Make API request
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/customer-support-bot",
+            "X-Title": "Customer Support Image Analysis"
+        }
+        
+        payload = {
+            "model": self.vision_model,
+            "messages": messages,
+            "max_tokens": 1000,
+            "temperature": 0.3
+        }
+        
+        url = f"{self.base_url}/chat/completions"
+        
+        async with self.session.post(url, headers=headers, json=payload) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"Vision API error: {response.status}: {error_text}")
+                raise Exception(f"Vision API error {response.status}: {error_text}")
+            
+            result = await response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            return self._parse_vision_response(content)
+    
+    def _parse_vision_response(self, content: str) -> Dict[str, Any]:
+        """Parse and validate vision model response"""
+        try:
+            # Clean up markdown code blocks if present
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+            
+            analysis = json.loads(content)
+            logger.info(f"Vision analysis complete: damage_detected={analysis.get('damage_detected')}, severity={analysis.get('severity')}")
+            return analysis
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON response: {e}")
+            return {
+                "damage_detected": None,
+                "damage_type": "unknown",
+                "severity": "unknown",
+                "description": content,
+                "matches_customer_claim": None,
+                "confidence": 0.0,
+                "recommendation": "escalate_to_human",
+                "reasoning": "Could not parse structured response from vision model"
+            }
+    
     async def close(self):
         """Close HTTP session"""
         if self.session:
             await self.session.close()
+            self.session = None
             logger.debug("ImageAnalysisTool session closed")
 
 

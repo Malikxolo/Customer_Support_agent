@@ -177,6 +177,19 @@ async def lifespan(app: FastAPI):
         max_tokens=1000
     )
 
+    # Customer bot model configs
+    customer_bot_analysis_config = config.create_llm_config(
+        provider=settings.customer_bot_analysis_provider,
+        model=settings.customer_bot_analysis_model,
+        max_tokens=16000
+    )
+    
+    customer_bot_response_config = config.create_llm_config(
+        provider=settings.customer_bot_response_provider,
+        model=settings.customer_bot_response_model,
+        max_tokens=1000
+    )
+
     brain_llm = LLMClient(brain_model_config)
     heart_llm = LLMClient(heart_model_config)
     indic_llm = LLMClient(indic_model_config)
@@ -185,6 +198,8 @@ async def lifespan(app: FastAPI):
     cot_whatsapp_llm = LLMClient(cot_whatsapp_config)
     sales_analysis_llm = LLMClient(sales_analysis_config)
     sales_response_llm = LLMClient(sales_response_config)
+    customer_bot_analysis_llm = LLMClient(customer_bot_analysis_config)
+    customer_bot_response_llm = LLMClient(customer_bot_response_config)
     tool_manager = ToolManager(config, brain_llm, web_model_config, settings.use_premium_search)
 
     # Initialize Zapier MCP integration
@@ -246,8 +261,8 @@ async def lifespan(app: FastAPI):
     cs_tool_manager = CSToolManager()
     
     agent = CustomerSupportAgent(
-        brain_llm=brain_llm,
-        heart_llm=heart_llm,
+        brain_llm=customer_bot_analysis_llm,
+        heart_llm=customer_bot_response_llm,
         tool_manager=cs_tool_manager
     )
     logging.info("✅ CustomerSupportAgent initialized")

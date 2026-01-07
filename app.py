@@ -18,7 +18,6 @@ from typing import Dict, Any, Optional, List
 import sys
 import logging.config
 import requests
-from chroma_log_handler import ChromaLogHandler
 from dotenv import load_dotenv
 import aiohttp
 from core.path_security import validate_safe_path, create_safe_user_path, sanitize_filename, sanitize_path_component
