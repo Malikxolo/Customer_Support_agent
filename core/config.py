@@ -7,7 +7,6 @@ import os
 import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from mem0.configs.base import MemoryConfig
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 from os import getenv
@@ -15,55 +14,7 @@ from typing import Callable, Coroutine, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
-custom_fact_extraction_prompt = """
-    You are an extractor. From the conversation below, return a JSON object with a single key "facts" whose value is a list of concise strings.
 
-    Rules:
-    - Include short declarative facts (e.g., "User loves pizza").
-    - **Always** include user questions/enquiries as facts in the format: "User asked: <question text>".
-    - Output only valid JSON.
-
-    Examples:
-    Input: "I love pizza." => {"facts":["User loves pizza"]}
-    Input: "How do I reset my password?" => {"facts":["User asked for instruction on resetting password?"]}
-    Input: "What is photosynthesis?" => {"facts":["User asked about photosynthesis?"]}
-
-    DO NOT store assistant responses.
-    Conversation:
-"""
-
-memory_config = MemoryConfig(
-    graph_store={
-        "provider": "neo4j",
-        "config": {
-            "url": getenv('NEO4J_URL'),
-            "username": getenv('NEO4J_USER'),
-            "password": getenv('NEO4J_PASSWORD')
-        }
-    },
-    vector_store={
-        "provider": "chroma",
-        "config": {
-            "collection_name": "mem0_collection",
-            "path": ".chromadb"
-        }
-    },
-    custom_fact_extraction_prompt=custom_fact_extraction_prompt
-    
-)
-
-SARVAM_SUPPORTED_LANGUAGES:set = {
-    "Hindi",
-    "Bengali",
-    "Gujarati",
-    "Kannada",
-    "Malayalam",
-    "Marathi",
-    "Odia",
-    "Punjabi",
-    "Tamil",
-    "Telugu"
-}
 
 
 @dataclass
@@ -121,7 +72,6 @@ class Config:
             'OPENROUTER_API_KEY': 'openrouter',
             'GROQ_API_KEY': 'groq',
             'DEEPSEEK_API_KEY': 'deepseek',
-            'SARVAM_API_KEY': 'sarvam'
         }
         
         for env_key, provider in provider_mappings.items():
@@ -179,10 +129,6 @@ class Config:
             base_url = "https://api.groq.com/openai/v1"
         elif provider == 'deepseek':
             base_url = "https://api.deepseek.com/v1"
-        elif provider == 'sarvam':
-            base_url = "https://api.sarvam.ai/v1"
-        elif provider == 'sarvam':
-            base_url = "https://api.sarvam.ai/v1"
         
         return LLMConfig(
             provider=provider,

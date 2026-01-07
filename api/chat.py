@@ -122,61 +122,11 @@ async def lifespan(app: FastAPI):
     )
     await FastAPILimiter.init(redis_client)
     
-    brain_model_config = config.create_llm_config(
-        provider=settings.brain_provider,
-        model=settings.brain_model,
-        max_tokens=16000 
-    )
-    heart_model_config = config.create_llm_config(
-        provider=settings.heart_provider,
-        model=settings.heart_model,
-        max_tokens=1000
-    )
-    
-    indic_model_config = config.create_llm_config(
-        provider=settings.indic_provider,
-        model=settings.indic_model,
-        max_tokens=1000
-    )
-    
     web_model_config = config.get_tool_configs(
         web_model=settings.web_model,
         use_premium_search=settings.use_premium_search
     )
     
-    # Routing layer config (decides simple vs CoT for WhatsApp)
-    routing_config = config.create_llm_config(
-        provider=settings.routing_provider,
-        model=settings.routing_model,
-        max_tokens=2000
-    )
-    
-    # WhatsApp-specific model configs
-    simple_whatsapp_config = config.create_llm_config(
-        provider=settings.simple_whatsapp_provider,
-        model=settings.simple_whatsapp_model,
-        max_tokens=4000
-    )
-    
-    cot_whatsapp_config = config.create_llm_config(
-        provider=settings.cot_whatsapp_provider,
-        model=settings.cot_whatsapp_model,
-        max_tokens=4000
-    )
-    
-    # Sales-specific model configs
-    sales_analysis_config = config.create_llm_config(
-        provider=settings.sales_analysis_provider,
-        model=settings.sales_analysis_model,
-        max_tokens=4000
-    )
-    
-    sales_response_config = config.create_llm_config(
-        provider=settings.sales_response_provider,
-        model=settings.sales_response_model,
-        max_tokens=1000
-    )
-
     # Customer bot model configs
     customer_bot_analysis_config = config.create_llm_config(
         provider=settings.customer_bot_analysis_provider,
@@ -190,57 +140,9 @@ async def lifespan(app: FastAPI):
         max_tokens=1000
     )
 
-    brain_llm = LLMClient(brain_model_config)
-    heart_llm = LLMClient(heart_model_config)
-    indic_llm = LLMClient(indic_model_config)
-    routing_llm = LLMClient(routing_config)
-    simple_whatsapp_llm = LLMClient(simple_whatsapp_config)
-    cot_whatsapp_llm = LLMClient(cot_whatsapp_config)
-    sales_analysis_llm = LLMClient(sales_analysis_config)
-    sales_response_llm = LLMClient(sales_response_config)
     customer_bot_analysis_llm = LLMClient(customer_bot_analysis_config)
     customer_bot_response_llm = LLMClient(customer_bot_response_config)
-    tool_manager = ToolManager(config, brain_llm, web_model_config, settings.use_premium_search)
-
-    # Initialize Zapier MCP integration
-    try:
-        zapier_initialized = await tool_manager.initialize_zapier_async()
-        if zapier_initialized:
-            logging.info("✅ Zapier MCP integration initialized successfully")
-        else:
-            logging.warning("⚠️ Zapier MCP integration not configured (ZAPIER_MCP_URL not set)")
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize Zapier MCP: {e}")
-
-    # Initialize MongoDB MCP integration
-    try:
-        mongodb_initialized = await tool_manager.initialize_mongodb_async()
-        if mongodb_initialized:
-            logging.info("✅ MongoDB MCP integration initialized successfully")
-        else:
-            logging.warning("⚠️ MongoDB MCP integration not configured (MONGODB_MCP_CONNECTION_STRING not set)")
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize MongoDB MCP: {e}")
-
-    # Initialize Redis MCP integration
-    try:
-        redis_initialized = await tool_manager.initialize_redis_async()
-        if redis_initialized:
-            logging.info("✅ Redis MCP integration initialized successfully")
-        else:
-            logging.warning("⚠️ Redis MCP integration not configured (REDIS_MCP_URL not set)")
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize Redis MCP: {e}")
-
-    # Initialize Grievance tool
-    try:
-        grievance_initialized = await tool_manager.initialize_grievance_async()
-        if grievance_initialized:
-            logging.info("✅ Grievance tool initialized successfully")
-        else:
-            logging.warning("⚠️ Grievance tool not enabled (GRIEVANCE_ENABLED=false)")
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize Grievance tool: {e}")
+    tool_manager = ToolManager(config, web_model_config, settings.use_premium_search)
 
     # Initialize language detector if enabled
     language_detector_llm = None
@@ -305,10 +207,10 @@ async def lifespan(app: FastAPI):
     finally:
         logging.info("⚡ Shutting down app lifespan...")
         
-        # Cleanup tool resources including Zapier MCP connection
+        # Cleanup tool resources
         try:
             await tool_manager.cleanup()
-            logging.info("✅ Tool resources cleaned up (including Zapier MCP)")
+            logging.info("✅ Tool resources cleaned up")
         except Exception as e:
             logging.warning(f"⚠️ Error during tool cleanup: {e}")
         

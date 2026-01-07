@@ -2,7 +2,6 @@
 Optimized Single-Pass Agent System with Workflow Routing
 Combines semantic analysis, tool execution, and response generation in minimal LLM calls
 Now supports sequential tool execution with middleware for dependent tools
-WITH REDIS CACHING for queries and formatted tool data
 
 WORKFLOW STAGES (follows JSON workflow):
 1. AIIntakeLayer → Initial sentiment analysis and categorization
@@ -34,11 +33,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 from os import getenv
-from mem0 import AsyncMemory
-import time
 from functools import partial
-from .config import AddBackgroundTask, memory_config
-from .redis_manager import RedisCacheManager
+from .config import AddBackgroundTask
 
 logger = logging.getLogger(__name__)
 
@@ -52,50 +48,27 @@ class CustomerSupportAgent:
         self.heart_llm = heart_llm  # For response generation
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
-        self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
-        self.cache_manager = RedisCacheManager()
         
         logger.info(f"CustomerSupportAgent initialized with tools: {self.available_tools}")
-        logger.info(f"Redis caching: {'ENABLED ✅' if self.cache_manager.enabled else 'DISABLED ⚠️'}")
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
-        """Process customer query with minimal LLM calls and caching"""
+        """Process customer query with minimal LLM calls"""
         self._start_worker_if_needed()
         logger.info(f"🔵 PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
         
-        cached_analysis = None
         analysis = None
         analysis_time = 0.0
         
         try:
-            # STEP 1: Check cache or analyze
-            cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
+            logger.info(f"🧠 Using chat history for context")
             
-            if cached_analysis:
-                logger.info(f"🎯 USING CACHED ANALYSIS")
-                analysis = cached_analysis
-                analysis_time = 0.0
-            else:
-                # Retrieve conversation context
-                memory_results = await self.memory.search(query[:100], user_id=user_id, limit=5)
-                memories = "\n".join([
-                    f"- {item['memory']}" 
-                    for item in memory_results.get("results", []) 
-                    if item.get("memory")
-                ]) or "No previous context."
-
-                logger.info(f"🧠 Retrieved memories: {len(memories)} chars")
-                
-                # Analyze query
-                analysis_start = datetime.now()
-                analysis = await self._analyze_query(query, chat_history, memories)
-                analysis_time = (datetime.now() - analysis_start).total_seconds()
-                
-                # Cache the analysis
-                await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
+            # Analyze query
+            analysis_start = datetime.now()
+            analysis = await self._analyze_query(query, chat_history)
+            analysis_time = (datetime.now() - analysis_start).total_seconds()
             
             # Log analysis results
             logger.info(f"📊 ANALYSIS RESULTS:")
@@ -135,37 +108,16 @@ class CustomerSupportAgent:
             
             # STEP 3: Generate response
             response_start = datetime.now()
-            # Always get memories for response generation
-            memory_results = await self.memory.search(query, user_id=user_id, limit=5)
-            memories = "\n".join([
-                f"- {item['memory']}" 
-                for item in memory_results.get("results", []) 
-                if item.get("memory")
-            ]) or "No previous context."
             
             final_response = await self._generate_response(
-                query, analysis, tool_results, chat_history, memories
-            )
-            
-            # Store conversation in memory (background task)
-            await self.task_queue.put(
-                AddBackgroundTask(
-                    func=partial(self.memory.add),
-                    params=(
-                        [
-                            {"role": "user", "content": query}, 
-                            {"role": "assistant", "content": final_response}
-                        ],
-                        user_id,
-                    ),
-                )
+                query, analysis, tool_results, chat_history
             )
             
             response_time = (datetime.now() - response_start).total_seconds()
             total_time = (datetime.now() - start_time).total_seconds()
             
-            # Count LLM calls
-            llm_calls = 1 if cached_analysis else 2  # Analysis + Response
+            # Count LLM calls (always 2: Analysis + Response)
+            llm_calls = 2
             
             logger.info(f"✅ COMPLETED in {total_time:.2f}s ({llm_calls} LLM calls)")
             
@@ -175,7 +127,6 @@ class CustomerSupportAgent:
                 "analysis": analysis,
                 "tool_results": tool_results,
                 "tools_used": tools_to_use,
-                "cache_hit": bool(cached_analysis),
                 "workflow": {
                     "current_stage": workflow_stage,
                     "next_stage": next_stage,
@@ -199,7 +150,7 @@ class CustomerSupportAgent:
                 "response": "I apologize, but I encountered an error. Please try again."
             }
     
-    async def _analyze_query(self, query: str, chat_history: List[Dict] = None, memories: str = "") -> Dict[str, Any]:
+    async def _analyze_query(self, query: str, chat_history: List[Dict] = None) -> Dict[str, Any]:
         """Analyze customer query to understand intent and select appropriate tools"""
         from datetime import datetime
         
@@ -210,7 +161,6 @@ class CustomerSupportAgent:
 
         QUERY: {query}
         HISTORY: {context}
-        CONTEXT: {memories}
 
         WORKFLOW STAGES (follow in order):
 
@@ -447,7 +397,7 @@ class CustomerSupportAgent:
         return selected_tools
     
     async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, 
-                                 chat_history: List[Dict], memories: str = "") -> str:
+                                 chat_history: List[Dict]) -> str:
         """Generate customer support response"""
         
         intent = analysis.get('intent', '')

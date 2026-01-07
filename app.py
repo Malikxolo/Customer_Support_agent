@@ -845,9 +845,6 @@ async def create_agents_async(config, brain_agent_config, heart_agent_config, ro
         # Create tool manager
         tool_manager = ToolManager(config, brain_llm, web_model_config, use_premium_search)
         
-        # Initialize Zapier MCP integration (if configured)
-        # This enables 8000+ app integrations via Zapier
-        await tool_manager.initialize_zapier_async()
         
         return {
             "tool_manager": tool_manager,
