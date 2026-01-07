@@ -1,39 +1,28 @@
 """
-Optimized Single-Pass Agent System with Workflow Routing
-Combines semantic analysis, tool execution, and response generation in minimal LLM calls
-Now supports sequential tool execution with middleware for dependent tools
+Customer Support Agent - Intelligent Workflow System
 
-WORKFLOW STAGES (follows JSON workflow):
-1. AIIntakeLayer → Initial sentiment analysis and categorization
-2. DeEscalation → Handles frustrated/angry customers with empathy
-3. PreEscalationGathering → Gather info (photo/reason) before escalation
-4. SensitiveTask → Decision: Refund/cancel/personal data?
-5. ComplianceVerification → Fraud check + image analysis for sensitive operations
-6. SecureHandlingTeam → Human handles verified sensitive operations
-7. AIResolvable → Decision: Can AI handle this?
-8. AIAutoResponse → AI provides information (order status, FAQs)
-9. InstantConfirmation → Quick resolution confirmation
-10. ImmediateIssue → Decision: Urgent or can wait?
-11. AIAssistedRouting → Urgent escalation to human agent
-12. TicketCreation → Create ticket for non-urgent issues
+Uses LLM intelligence to naturally follow customer support workflow:
+- Analyzes customer intent, sentiment, and urgency
+- Selects appropriate tools based on context
+- Generates empathetic, helpful responses in customer's language
 
-TOOLS:
-- live_information, knowledge_base, verification, image_analysis, 
-  assign_agent, raise_ticket, order_action (all placeholders)
+AVAILABLE TOOLS:
+- live_information: Order status, tracking, customer data
+- knowledge_base: Policies, FAQs, product info
+- verification: Fraud check for sensitive operations
+- image_analysis: Analyze product photos for damage/defects
+- order_action: Process refunds, cancellations, replacements
+- assign_agent: Escalate to human agent
+- raise_ticket: Create support ticket for investigation
 """
 
 import json
 import logging
 import asyncio
-import uuid
-import re
-import os
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
-from os import getenv
-from functools import partial
 from .config import AddBackgroundTask
 
 logger = logging.getLogger(__name__)
@@ -41,17 +30,71 @@ logger = logging.getLogger(__name__)
 
 
 class CustomerSupportAgent:
-    """Simplified agent for customer support with minimal LLM calls"""
+    """Intelligent customer support agent with minimal LLM calls"""
     
     def __init__(self, brain_llm, heart_llm, tool_manager):
         self.brain_llm = brain_llm  # For analysis
         self.heart_llm = heart_llm  # For response generation
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
+        self.tool_descriptions = self._get_tool_descriptions()
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
         
         logger.info(f"CustomerSupportAgent initialized with tools: {self.available_tools}")
+    
+    def _get_tool_descriptions(self) -> str:
+        """Get formatted tool descriptions for LLM prompts"""
+        tools_info = {
+            "live_information": {
+                "purpose": "Get real-time order and customer information",
+                "use_when": "Customer asks about order status, tracking, delivery, order history",
+                "examples": "Where is my order?, Track order #12345, What's my order status?"
+            },
+            "knowledge_base": {
+                "purpose": "Search company policies, FAQs, product guides",
+                "use_when": "Customer asks about policies, returns, shipping info, product questions",
+                "examples": "What's your return policy?, How do I return an item?, Shipping times?"
+            },
+            "verification": {
+                "purpose": "Fraud check and risk assessment for sensitive operations",
+                "use_when": "Before processing refunds, cancellations, or account changes",
+                "returns": "risk_level (low/medium/high) - if high, escalate to human"
+            },
+            "image_analysis": {
+                "purpose": "Analyze product photos for damage, defects, or issues",
+                "use_when": "Customer reports broken/defective item AND has shared a photo",
+                "returns": "damage assessment, severity, recommendation"
+            },
+            "order_action": {
+                "purpose": "Process refund, cancel, replace, generate return label",
+                "use_when": "After verification passes with low/medium risk",
+                "important": "Always use verification tool FIRST before this"
+            },
+            "assign_agent": {
+                "purpose": "Escalate to human agent for immediate help",
+                "use_when": "Very frustrated customer, urgent/complex issue, high fraud risk, customer requests human, sensitive operations after verification"
+            },
+            "raise_ticket": {
+                "purpose": "Create support ticket for investigation",
+                "use_when": "Issue needs research (warehouse/courier checks) but is not urgent"
+            }
+        }
+        
+        formatted = []
+        for name, info in tools_info.items():
+            if name in self.available_tools:
+                formatted.append(f"• {name}:")
+                formatted.append(f"  Purpose: {info['purpose']}")
+                formatted.append(f"  Use when: {info['use_when']}")
+                if 'examples' in info:
+                    formatted.append(f"  Examples: {info['examples']}")
+                if 'returns' in info:
+                    formatted.append(f"  Returns: {info['returns']}")
+                if 'important' in info:
+                    formatted.append(f"  ⚠️ {info['important']}")
+        
+        return "\n".join(formatted)
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
         """Process customer query with minimal LLM calls"""
@@ -59,67 +102,42 @@ class CustomerSupportAgent:
         logger.info(f"🔵 PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
         
-        analysis = None
-        analysis_time = 0.0
-        
         try:
-            logger.info(f"🧠 Using chat history for context")
-            
-            # Analyze query
+            # Step 1: Analyze query (1 LLM call)
             analysis_start = datetime.now()
             analysis = await self._analyze_query(query, chat_history)
             analysis_time = (datetime.now() - analysis_start).total_seconds()
             
-            # Log analysis results
+            # Log analysis details
             logger.info(f"📊 ANALYSIS RESULTS:")
+            logger.info(f"   Language: {analysis.get('language', 'en')}")
             logger.info(f"   Intent: {analysis.get('intent', 'Unknown')}")
-            logger.info(f"   Sentiment: {analysis.get('sentiment', {}).get('emotion', 'neutral')}")
+            logger.info(f"   Sentiment: {analysis.get('sentiment', {})}")
+            logger.info(f"   Needs De-escalation: {analysis.get('needs_de_escalation', False)}")
             logger.info(f"   Needs More Info: {analysis.get('needs_more_info', False)}")
             logger.info(f"   Missing Info: {analysis.get('missing_info', 'none')}")
             logger.info(f"   Tools Selected: {analysis.get('tools_to_use', [])}")
-            logger.info(f"   Tool Sequence: {analysis.get('tool_sequence', 'parallel')}")
-            logger.info(f"   Needs De-escalation: {analysis.get('needs_de_escalation', False)}")
+            logger.info(f"   Reasoning: {analysis.get('reasoning', 'N/A')}")
             
-            # WORKFLOW ROUTING: Validate and route based on workflow stage
-            workflow_stage = analysis.get('workflow_stage', 'AIAutoResponse')
-            next_stage = analysis.get('next_stage', '')
-            workflow_path = analysis.get('workflow_path', [workflow_stage])
+            # Step 2: Execute tools if needed
+            tools_to_use = analysis.get('tools_to_use', [])
             
-            logger.info(f"📍 WORKFLOW ROUTING:")
-            logger.info(f"   Current Stage: {workflow_stage}")
-            logger.info(f"   Next Stage: {next_stage}")
-            logger.info(f"   Workflow Path: {' → '.join(workflow_path)}")
-            
-            # Validate tools match workflow stage
-            tools_to_use = self._validate_workflow_tools(workflow_stage, analysis.get('tools_to_use', []), analysis)
-            
-            logger.info(f"   Validated Tools: {tools_to_use}")
-            
-            # STEP 2: Skip tool execution if we need more info from customer
             if analysis.get('needs_more_info', False):
-                logger.info("❓ Need more info from customer - skipping tools")
+                logger.info("❓ Need more info - skipping tools")
                 tool_results = {}
                 tool_time = 0.0
             else:
-                # Execute tools
                 tool_start = datetime.now()
                 tool_results = await self._execute_tools(tools_to_use, query, analysis, user_id)
                 tool_time = (datetime.now() - tool_start).total_seconds()
             
-            # STEP 3: Generate response
+            # Step 3: Generate response (1 LLM call)
             response_start = datetime.now()
-            
-            final_response = await self._generate_response(
-                query, analysis, tool_results, chat_history
-            )
-            
+            final_response = await self._generate_response(query, analysis, tool_results, chat_history)
             response_time = (datetime.now() - response_start).total_seconds()
+            
             total_time = (datetime.now() - start_time).total_seconds()
-            
-            # Count LLM calls (always 2: Analysis + Response)
-            llm_calls = 2
-            
-            logger.info(f"✅ COMPLETED in {total_time:.2f}s ({llm_calls} LLM calls)")
+            logger.info(f"✅ COMPLETED in {total_time:.2f}s (2 LLM calls)")
             
             return {
                 "success": True,
@@ -127,19 +145,12 @@ class CustomerSupportAgent:
                 "analysis": analysis,
                 "tool_results": tool_results,
                 "tools_used": tools_to_use,
-                "workflow": {
-                    "current_stage": workflow_stage,
-                    "next_stage": next_stage,
-                    "workflow_path": workflow_path,
-                    "is_complete": analysis.get('is_workflow_complete', False)
-                },
                 "processing_time": {
                     "analysis": analysis_time,
                     "tools": tool_time,
                     "response": response_time,
                     "total": total_time
-                },
-                "llm_calls": llm_calls
+                }
             }
             
         except Exception as e:
@@ -151,92 +162,99 @@ class CustomerSupportAgent:
             }
     
     async def _analyze_query(self, query: str, chat_history: List[Dict] = None) -> Dict[str, Any]:
-        """Analyze customer query to understand intent and select appropriate tools"""
-        from datetime import datetime
-        
-        context = chat_history[-5:] if chat_history else []
+        """Analyze customer query using LLM intelligence"""
         current_date = datetime.now().strftime("%B %d, %Y")
         
-        analysis_prompt = f"""Analyze customer support query (date: {current_date})
-
-        QUERY: {query}
-        HISTORY: {context}
-
-        WORKFLOW STAGES (follow in order):
-
-        1. AIIntakeLayer: Analyze sentiment (emotion, intensity, urgency)
+        # Format chat history for embedding in prompt
+        formatted_history = ""
+        if chat_history:
+            history_entries = []
+            for msg in chat_history[-10:]:  # Last 10 messages for context
+                role = msg.get('role', 'unknown').upper()
+                content = msg.get('content', '')
+                history_entries.append(f"{role}: {content}")
+            formatted_history = "\n".join(history_entries)
         
-        2. De-Escalation: If emotion=angry/frustrated AND intensity=high → needs_de_escalation=true
-        
-        3. Sensitive Task (refund/cancel/exchange)?
-           YES → Check what info needed FIRST:
-           
-           INFORMATION GATHERING:
-           - If mentions: broken, defective, damaged, cracked, not working
-             → missing_info="photo+reason", info_category="product_defect"
-           
-           - If mentions: don't like, changed mind, wrong size, don't need
-             → missing_info="reason", info_category="preference_change"
-           
-           - If mentions: wrong item, different product
-             → missing_info="photo+description", info_category="wrong_item"
-           
-           - If missing order_id → missing_info="order_id"
-           
-           THEN determine workflow:
-           - If missing info → needs_more_info=true, workflow_stage="PreEscalationGathering"
-           - If have all info → workflow_stage="ComplianceVerification"
-             Tools: ["verification", "image_analysis", "assign_agent"] (sequential)
-             Note: Only include image_analysis if photo was provided
-           
-           NO → Continue to Stage 4
-        
-        4. AI Resolvable (order status, FAQs, policies)?
-           YES → workflow_stage="AIAutoResponse"
-                 Tools: ["live_information"] or ["knowledge_base"]
-           NO → Continue to Stage 5
-        
-        5. Urgent?
-           YES → workflow_stage="AIAssistedRouting", tools=["assign_agent"]
-           NO → workflow_stage="TicketCreation", tools=["raise_ticket"]
+        analysis_prompt = f"""You are analyzing a customer support query. Understand what the customer needs and decide how to help them.
 
-        Analyze and return JSON:
+TODAY'S DATE: {current_date}
 
-        1. CUSTOMER INTENT: What does the customer need?
-        2. SENTIMENT: Emotion, intensity, urgency
-        3. CONVERSATION STATE: Do you need more information before taking action?
-        4. TOOL SELECTION: Which tools (if any) based on principles above
-        5. RESPONSE STRATEGY: Tone, length, priority
+CUSTOMER QUERY: {query}
 
-        {{
-        "intent": "what customer needs",
-        "sentiment": {{"emotion": "frustrated|satisfied|confused|urgent|neutral", "intensity": "low|medium|high", "urgency": "low|medium|high"}},
-        "needs_more_info": true or false,
-        "missing_info": "order_id|photo|reason|photo+reason|photo+description|details|none",
-        "info_category": "product_defect|preference_change|wrong_item|missing_order|none",
-        "needs_de_escalation": true or false,
-        "de_escalation_message": "brief empathy if needed",
-        "tools_to_use": ["tool1", "tool2"],
-        "tool_sequence": "parallel|sequential",
-        "enhanced_queries": {{"live_information_0": "query", "knowledge_base_0": "query", "image_analysis_0": "analyze defect"}},
-        "response_strategy": {{"tone": "empathetic|professional|friendly", "length": "brief|moderate", "priority": "emotion_first|solution_first"}},
-        "workflow_stage": "AIIntakeLayer|DeEscalation|PreEscalationGathering|ComplianceVerification|SecureHandlingTeam|AIAutoResponse|AIAssistedRouting|TicketCreation",
-        "next_stage": "next stage",
-        "workflow_path": ["stage1", "stage2"]
-        }}"""
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history if formatted_history else 'No previous conversation.'}
+
+AVAILABLE TOOLS:
+{self.tool_descriptions}
+
+=== WORKFLOW GUIDANCE ===
+
+Think through these steps naturally:
+
+1. UNDERSTAND THE CUSTOMER
+   - What language are they writing in? (You must respond in the same language)
+   - How are they feeling? (angry, frustrated, confused, calm, satisfied)
+   - How urgent is their issue?
+   - If very angry/frustrated with high intensity → they need de-escalation (empathy first)
+
+2. IDENTIFY THEIR NEED
+   - What do they actually want? (refund, order status, information, help with issue, etc.)
+   - Is this a follow-up to previous conversation? Check history for context.
+
+3. DO YOU NEED MORE INFORMATION?
+   Consider if you're missing critical info to help them:
+   - For refund/cancellation → Do you have the order ID?
+   - For damaged item → Do you have a photo? Do you know what happened?
+   - For wrong item → Do you have a photo? What did they receive vs expect?
+   
+   If missing essential info → set needs_more_info=true and specify what's missing
+
+4. SELECT TOOLS (only if you have enough info)
+   - Order status/tracking questions → live_information
+   - Policy/FAQ questions → knowledge_base  
+   - Refund/cancel requests → verification first (check risk), then assign_agent for handling
+   - Damaged product with photo → image_analysis + verification + assign_agent
+   - Very frustrated or complex issue → assign_agent
+   - Non-urgent issue needing research → raise_ticket
+
+5. SPECIAL CASES
+   - Customer explicitly asks for human → assign_agent
+   - High-risk verification result → assign_agent (not order_action)
+   - Simple greeting or thanks → no tools needed
+
+Return your analysis as JSON:
+
+{{
+  "language": "detected language code (en, es, fr, ar, de, etc.)",
+  "intent": "brief description of what customer wants",
+  "sentiment": {{
+    "emotion": "angry|frustrated|confused|neutral|satisfied|urgent",
+    "intensity": "low|medium|high",
+    "urgency": "low|medium|high|critical"
+  }},
+  "needs_de_escalation": true or false,
+  "de_escalation_approach": "how to acknowledge their feelings if needed, or empty string",
+  "needs_more_info": true or false,
+  "missing_info": "what specific info is needed (order_id, photo, reason, details) or null if none",
+  "tools_to_use": ["tool1", "tool2"] or empty array if no tools needed,
+  "tool_queries": {{
+    "tool_name": "specific query to pass to this tool"
+  }},
+  "reasoning": "brief explanation of your decision"
+}}"""
 
         try:
             response = await self.brain_llm.generate(
                 messages=[{"role": "user", "content": analysis_prompt}],
-                system_prompt=f"You analyze customer queries as of {current_date}. Return JSON only.",
+                system_prompt="You analyze customer support queries intelligently. Return valid JSON only, no other text.",
                 temperature=0.1,
-                max_tokens=2000
+                max_tokens=1500
             )
             
             json_str = self._extract_json(response)
             result = json.loads(json_str)
             
-            logger.info(f"✅ Analysis complete")
+            logger.info(f"✅ Analysis complete: {result.get('intent', 'Unknown intent')}")
             return result
             
         except json.JSONDecodeError as e:
@@ -246,247 +264,149 @@ class CustomerSupportAgent:
     def _get_fallback_analysis(self, query: str) -> Dict[str, Any]:
         """Fallback analysis when parsing fails"""
         return {
+            "language": "en",
             "intent": query,
-            "sentiment": {
-                "emotion": "neutral",
-                "intensity": "medium",
-                "urgency": "medium"
-            },
-            "needs_more_info": False,
-            "missing_info": "none",
+            "sentiment": {"emotion": "neutral", "intensity": "medium", "urgency": "medium"},
             "needs_de_escalation": False,
-            "de_escalation_message": "",
+            "de_escalation_approach": "",
+            "needs_more_info": False,
+            "missing_info": None,
             "tools_to_use": [],
-            "tool_sequence": "parallel",
-            "enhanced_queries": {},
-            "response_strategy": {
-                "tone": "professional",
-                "length": "moderate",
-                "priority": "solution_first"
-            },
-            "key_points": []
+            "tool_queries": {},
+            "reasoning": "Fallback analysis - JSON parsing failed"
         }
 
     async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
-        """Execute tools in parallel or sequentially based on analysis"""
+        """Execute tools in parallel"""
         if not tools:
             return {}
         
         results = {}
-        enhanced_queries = analysis.get('enhanced_queries', {})
-        tool_sequence = analysis.get('tool_sequence', 'parallel')
+        tasks = []
+        tool_queries = analysis.get('tool_queries', {})
         
-        # Check if we need sequential execution (verification → order_action)
-        if tool_sequence == 'sequential' and 'verification' in tools:
-            # Run verification first
-            logger.info("🔐 Running verification check first...")
-            result = await self.tool_manager.execute_tool('verification', query=query, user_id=user_id)
-            results['verification_0'] = result
+        for i, tool in enumerate(tools):
+            if tool not in self.available_tools:
+                logger.warning(f"⚠️ Tool '{tool}' not available, skipping")
+                continue
             
-            # Check risk level
-            risk = result.get('fraud_check', {}).get('risk_level', 'low')
-            if risk == 'high':
-                logger.warning("⚠️ High fraud risk detected - skipping order_action")
-                # Remove order_action from tools
-                tools = [t for t in tools if t != 'order_action']
-                # Add assign_agent instead
-                if 'assign_agent' not in tools:
-                    tools.append('assign_agent')
-                    logger.info("🚨 Adding assign_agent for human review")
+            tool_key = f"{tool}_{i}"
+            tool_query = tool_queries.get(tool, query)
             
-            # Now run remaining tools in parallel
-            remaining_tools = [t for t in tools if t != 'verification']
-            if remaining_tools:
-                await self._execute_parallel(remaining_tools, enhanced_queries, query, user_id, results)
-        else:
-            # Parallel execution (existing logic)
-            await self._execute_parallel(tools, enhanced_queries, query, user_id, results)
+            logger.info(f"🔧 Queueing {tool}: '{tool_query[:50]}...'")
+            task = self.tool_manager.execute_tool(tool, query=tool_query, user_id=user_id)
+            tasks.append((tool_key, task))
+        
+        # Execute all in parallel
+        for tool_key, task in tasks:
+            try:
+                results[tool_key] = await task
+                logger.info(f"✅ {tool_key} complete")
+            except Exception as e:
+                logger.error(f"❌ {tool_key} failed: {e}")
+                results[tool_key] = {"error": str(e), "success": False}
         
         return results
-    
-    async def _execute_parallel(self, tools: List[str], enhanced_queries: Dict, query: str, user_id: str, results: Dict):
-        """Helper for parallel tool execution"""
-        tasks = []
-        tool_counter = {}
-        
-        for tool in tools:
-            if tool in self.available_tools:
-                count = tool_counter.get(tool, 0)
-                tool_counter[tool] = count + 1
-                
-                indexed_key = f"{tool}_{count}"
-                tool_query = enhanced_queries.get(indexed_key, query)
-                
-                logger.info(f"🔧 Executing {indexed_key}: '{tool_query}'")
-                
-                task = self.tool_manager.execute_tool(tool, query=tool_query, user_id=user_id)
-                tasks.append((indexed_key, task))
-        
-        # Gather results
-        for tool_name, task in tasks:
-            try:
-                result = await task
-                results[tool_name] = result
-                logger.info(f"✅ {tool_name} completed")
-            except Exception as e:
-                logger.error(f"❌ {tool_name} failed: {e}")
-                results[tool_name] = {"error": str(e)}
-    
-    def _validate_workflow_tools(self, workflow_stage: str, selected_tools: List[str], analysis: Dict) -> List[str]:
-        """Validate that selected tools align with workflow stage and adjust if needed"""
-        
-        # Define expected tools for each workflow stage
-        stage_tool_mapping = {
-            "AIIntakeLayer": [],
-            "DeEscalation": [],
-            "PreEscalationGathering": [],  # NEW - gathering info before escalation
-            "SensitiveTask": [],
-            "ComplianceVerification": ["verification", "image_analysis", "assign_agent"],  # Updated - added image_analysis
-            "SecureHandlingTeam": ["assign_agent"],
-            "AIResolvable": [],
-            "AIAutoResponse": ["live_information", "knowledge_base"],
-            "InstantConfirmation": [],
-            "ImmediateIssue": [],
-            "AIAssistedRouting": ["assign_agent"],
-            "LiveAgentAssist": ["assign_agent"],
-            "QuickResolution": ["order_action"],
-            "TicketCreation": ["raise_ticket"],
-            "Investigation": [],
-            "FollowUp": [],
-            "PostResolution": []
-        }
-        
-        expected_tools = stage_tool_mapping.get(workflow_stage, [])
-        
-        # If stage has expected tools, validate selection
-        if expected_tools:
-            # Check if selected tools align with stage
-            valid_tools = [tool for tool in selected_tools if tool in expected_tools or tool in self.available_tools]
-            
-            # If ComplianceVerification, ensure proper tool chain
-            if workflow_stage == "ComplianceVerification":
-                # Always need verification and assign_agent
-                if "verification" not in valid_tools:
-                    valid_tools.insert(0, "verification")
-                if "assign_agent" not in valid_tools:
-                    valid_tools.append("assign_agent")
-                
-                # Add image_analysis only if customer provided photo (check missing_info)
-                missing_info = analysis.get('missing_info', 'none')
-                if 'photo' not in missing_info and "image_analysis" not in valid_tools:
-                    # Photo was provided, add image_analysis
-                    valid_tools.insert(1, "image_analysis")
-                    logger.info(f"   🖼️ Added image_analysis (photo available)")
-                elif 'photo' in missing_info and "image_analysis" in valid_tools:
-                    # Photo not provided yet, remove image_analysis
-                    valid_tools.remove("image_analysis")
-                    logger.info(f"   ⚠️ Removed image_analysis (no photo yet)")
-                
-                # Ensure sequential execution
-                analysis['tool_sequence'] = 'sequential'
-                logger.info(f"   ⚙️ ComplianceVerification chain: {valid_tools}")
-            
-            # If no valid tools but stage expects tools, use first expected tool
-            if not valid_tools and expected_tools:
-                valid_tools = [expected_tools[0]]
-                logger.warning(f"   ⚠️ No valid tools for {workflow_stage}, using default: {expected_tools[0]}")
-            
-            return valid_tools
-        
-        # For decision stages or no-tool stages, return selected tools as-is
-        return selected_tools
     
     async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, 
                                  chat_history: List[Dict]) -> str:
         """Generate customer support response"""
         
-        intent = analysis.get('intent', '')
-        sentiment = analysis.get('sentiment', {})
-        strategy = analysis.get('response_strategy', {})
+        # Format chat history
+        formatted_history = ""
+        if chat_history:
+            history_entries = []
+            for msg in chat_history[-10:]:
+                role = msg.get('role', 'unknown').upper()
+                content = msg.get('content', '')
+                history_entries.append(f"{role}: {content}")
+            formatted_history = "\n".join(history_entries)
         
         # Format tool results
         tool_data = self._format_tool_results(tool_results)
-        context = chat_history[-5:] if chat_history else []
         
-        response_prompt = f"""Customer support response generation.
+        logger.info("="*60)
+        logger.info("🔧 TOOL RESULTS FOR RESPONSE:")
+        logger.info("="*60)
+        logger.info(tool_data)
+        logger.info("="*60)
+        
+        # Extract analysis data
+        language = analysis.get('language', 'en')
+        sentiment = analysis.get('sentiment', {})
+        needs_de_escalation = analysis.get('needs_de_escalation', False)
+        de_escalation_approach = analysis.get('de_escalation_approach', '')
+        needs_more_info = analysis.get('needs_more_info', False)
+        missing_info = analysis.get('missing_info')
+        
+        response_prompt = f"""You are a friendly, helpful customer support agent. Generate a response to help this customer.
 
-        QUERY: {query}
-        INTENT: {intent}
-        SENTIMENT: {sentiment.get('emotion')}, urgency={sentiment.get('urgency')}
-        WORKFLOW: {analysis.get('workflow_stage')}
-        
-        TOOLS EXECUTED: {"Yes" if tool_data != "No additional data available" else "No"}
-        TOOL DATA: {tool_data}
+CUSTOMER QUERY: {query}
 
-        ============ RESPONSE RULES ============
-        
-        1. CHECK TOOL EXECUTION
-        - If TOOLS EXECUTED=No → DO NOT claim "I've verified/connected/created"
-        - Only describe actions if you see ACTUAL tool results
-        
-        2. HANDLE MISSING INFO (PRIORITY #1)
-        If Needs More Info={analysis.get('needs_more_info', False)}, Missing={analysis.get('missing_info', 'none')}, Category={analysis.get('info_category', 'none')}:
-          
-          a) Show empathy (1 sentence)
-          b) Ask specifically based on missing_info:
-             - "order_id" → "Could you provide your order number?"
-             - "photo" → "Could you share a photo of [the issue]?"
-             - "reason" → "Could you tell me why you'd like [refund/exchange]?"
-             - "photo+reason" → "Could you share a photo and briefly describe what happened?"
-             - "photo+description" → "Could you share a photo and describe what you ordered vs what you got?"
-          c) Explain next step: "Once I have that, I'll [verify/connect/help]."
-          
-          STOP HERE if needs_more_info=True
-        
-        3. DE-ESCALATION
-        If needs_de_escalation={analysis.get('needs_de_escalation', False)}:
-          START with: {analysis.get('de_escalation_message', '')}
-        
-        4. USE TOOL DATA
-        - verification + image_analysis + assign_agent → "I've analyzed the issue and connected you with a specialist."
-        - verification + assign_agent → "I've verified your request and connected you with a specialist."
-        - assign_agent only → "Connecting you with an agent."
-        - live_information/knowledge_base → Answer directly from data
-        - raise_ticket → "Created ticket #[number]. Team will respond within [time]."
-        
-        5. FORMAT: Maximum 3-4 sentences, {strategy.get('tone', 'professional')} tone
+RESPOND IN THIS LANGUAGE: {language}
 
-        Generate response:"""
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history if formatted_history else 'No previous conversation.'}
+
+CUSTOMER STATE:
+- Emotion: {sentiment.get('emotion', 'neutral')}
+- Intensity: {sentiment.get('intensity', 'medium')}
+- Urgency: {sentiment.get('urgency', 'medium')}
+- Needs de-escalation: {needs_de_escalation}
+
+INFORMATION FROM TOOLS:
+{tool_data}
+
+INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None - you have what you need'}
+
+=== RESPONSE GUIDELINES ===
+
+1. LANGUAGE: You MUST respond in {language}. Mirror the customer's language exactly.
+
+2. DE-ESCALATION (if needed = {needs_de_escalation}):
+   Start with empathy. Approach: {de_escalation_approach if de_escalation_approach else 'Acknowledge their frustration, show you understand'}
+
+3. MISSING INFORMATION (if needs_more_info = {needs_more_info}):
+   - Acknowledge their request warmly
+   - Ask specifically for: {missing_info}
+   - Explain what you'll do once you have it
+
+4. USING TOOL RESULTS:
+   - If verification done → mention you've verified their request
+   - If image analyzed → reference what was found
+   - If agent assigned → confirm help is on the way with ETA
+   - If ticket created → give them the ticket number and timeline
+   - If order/policy info retrieved → answer their question directly
+
+5. HANDLE TOOL ERRORS:
+   - If any tool shows "Error" or failed → acknowledge the issue
+   - For image_analysis error → politely ask customer to share the image again (it may not have uploaded properly)
+   - Don't pretend the tool worked if it failed
+
+6. FORMAT:
+   - Keep it concise (2-4 sentences unless explaining something complex)
+   - Be warm but professional
+   - End with a helpful next step or question if appropriate
+   - Do NOT make up information that wasn't in the tool results
+   - Do NOT claim you did something if no tools were executed
+
+Generate your response:"""
 
         try:
-            max_tokens = {
-                "brief": 150,
-                "moderate": 300,
-                "detailed": 500
-            }.get(strategy.get('length', 'moderate'), 300)
-            
-            messages = chat_history[-4:] if chat_history else []
-            messages.append({"role": "user", "content": response_prompt})
-            
-            logger.info("="*80)
-            logger.info("💬 RESPONSE GENERATION PROMPT:")
-            logger.info("="*80)
-            logger.info(f"QUERY: {query}")
-            logger.info(f"INTENT: {intent}")
-            logger.info(f"SENTIMENT: {sentiment}")
-            logger.info(f"TOOL RESULTS:\n{tool_data}")
-            logger.info(f"MAX TOKENS: {max_tokens}")
-            logger.info("="*80)
-            
             response = await self.heart_llm.generate(
-                messages,
+                messages=[{"role": "user", "content": response_prompt}],
+                system_prompt="You are a helpful, empathetic customer support agent. Respond naturally and helpfully.",
                 temperature=0.4,
-                max_tokens=max_tokens,
-                system_prompt="You are a helpful customer support assistant."
+                max_tokens=400
             )
             
             response = self._clean_response(response)
             
-            logger.info("="*80)
-            logger.info("✅ FULL RESPONSE GENERATED:")
-            logger.info("="*80)
+            logger.info("="*60)
+            logger.info("💬 RESPONSE GENERATED:")
+            logger.info("="*60)
             logger.info(response)
-            logger.info("="*80)
+            logger.info("="*60)
             logger.info(f"Response length: {len(response)} chars")
             
             return response
@@ -498,30 +418,101 @@ class CustomerSupportAgent:
     def _format_tool_results(self, tool_results: dict) -> str:
         """Format tool results for response generation"""
         if not tool_results:
-            return "No additional data available"
+            return "No tools were executed - respond based on your knowledge or ask for needed information."
         
         formatted = []
         
-        for tool, result in tool_results.items():
-            if isinstance(result, dict) and 'error' not in result:
-                if "success" in result and result["success"]:
-                    # Knowledge base results
-                    if "retrieved" in result:
-                        formatted.append(f"{tool.upper()}:\n{result.get('retrieved', '')}\n")
-                    
-                    # Web search results
-                    elif 'results' in result and isinstance(result['results'], list):
-                        formatted.append(f"{tool.upper()} RESULTS:\n")
-                        for item in result['results'][:3]:
-                            title = item.get('title', '')
-                            snippet = item.get('snippet', '')
-                            formatted.append(f"- {title}\n  {snippet}\n")
-                    
-                    # Calculator or other results
-                    elif 'result' in result:
-                        formatted.append(f"{tool.upper()}: {result['result']}")
+        for tool_key, result in tool_results.items():
+            # Skip failed results
+            if not isinstance(result, dict):
+                continue
+            if result.get('error'):
+                formatted.append(f"⚠️ {tool_key}: Error - {result.get('error')}")
+                continue
+            if not result.get('success', True):
+                continue
+            
+            # Extract base tool name (remove _0, _1 suffix)
+            tool_name = tool_key.rsplit('_', 1)[0] if '_' in tool_key else tool_key
+            
+            # Format based on tool type
+            if tool_name == "live_information":
+                data = result.get('data', {})
+                if data:
+                    formatted.append("📦 ORDER/CUSTOMER INFORMATION:")
+                    for key, value in data.items():
+                        formatted.append(f"  • {key}: {value}")
+                else:
+                    formatted.append("📦 ORDER INFO: No data found for this query")
+            
+            elif tool_name == "knowledge_base":
+                articles = result.get('articles', [])
+                retrieved = result.get('retrieved', '')
+                if retrieved:
+                    formatted.append(f"📚 KNOWLEDGE BASE:\n{retrieved}")
+                elif articles:
+                    formatted.append("📚 KNOWLEDGE BASE RESULTS:")
+                    for article in articles[:3]:
+                        title = article.get('title', 'Untitled')
+                        content = article.get('content', '')[:300]
+                        formatted.append(f"  • {title}: {content}")
+                else:
+                    formatted.append("📚 KNOWLEDGE BASE: No relevant articles found")
+            
+            elif tool_name == "verification":
+                fraud_check = result.get('fraud_check', {})
+                risk_level = fraud_check.get('risk_level', result.get('risk_level', 'unknown'))
+                recommendation = fraud_check.get('recommendation', 'proceed')
+                formatted.append("🔐 VERIFICATION RESULT:")
+                formatted.append(f"  • Risk Level: {risk_level}")
+                formatted.append(f"  • Recommendation: {recommendation}")
+                if risk_level == 'high':
+                    formatted.append("  ⚠️ HIGH RISK - Escalate to human agent")
+            
+            elif tool_name == "image_analysis":
+                analysis = result.get('analysis', {})
+                ai_detection = result.get('ai_detection', {})
+                if analysis:
+                    formatted.append("🖼️ IMAGE ANALYSIS:")
+                    formatted.append(f"  • Damage Detected: {analysis.get('damage_detected', 'unknown')}")
+                    formatted.append(f"  • Type: {analysis.get('damage_type', 'N/A')}")
+                    formatted.append(f"  • Severity: {analysis.get('severity', 'unknown')}")
+                    formatted.append(f"  • Description: {analysis.get('description', 'N/A')}")
+                    formatted.append(f"  • Recommendation: {analysis.get('recommendation', 'N/A')}")
+                if ai_detection.get('is_ai_generated'):
+                    formatted.append("  ⚠️ Warning: Image may be AI-generated")
+            
+            elif tool_name == "assign_agent":
+                agent_info = result.get('agent_info', {})
+                formatted.append("👤 AGENT ASSIGNED:")
+                formatted.append(f"  • Agent: {agent_info.get('agent_name', 'Support Specialist')}")
+                formatted.append(f"  • ETA: {result.get('eta', '5-10 minutes')}")
+                formatted.append(f"  • Channel: {result.get('channel', 'chat')}")
+                if result.get('assignment_id'):
+                    formatted.append(f"  • Reference: {result.get('assignment_id')}")
+            
+            elif tool_name == "raise_ticket":
+                formatted.append("🎫 TICKET CREATED:")
+                formatted.append(f"  • Ticket ID: {result.get('ticket_id', 'N/A')}")
+                formatted.append(f"  • Status: {result.get('status', 'open')}")
+                formatted.append(f"  • Priority: {result.get('priority', 'medium')}")
+                if result.get('category'):
+                    formatted.append(f"  • Category: {result.get('category')}")
+            
+            elif tool_name == "order_action":
+                action = result.get('action', 'unknown')
+                formatted.append(f"📋 ORDER ACTION ({action.upper()}):")
+                formatted.append(f"  • Status: {result.get('status', 'pending')}")
+                if result.get('refund_amount'):
+                    formatted.append(f"  • Refund Amount: ${result.get('refund_amount')}")
+                if result.get('replacement_order_id'):
+                    formatted.append(f"  • Replacement Order: {result.get('replacement_order_id')}")
+                if result.get('tracking_number'):
+                    formatted.append(f"  • Tracking: {result.get('tracking_number')}")
+                if result.get('label_url'):
+                    formatted.append(f"  • Return Label: {result.get('label_url')}")
         
-        return "\n".join(formatted) if formatted else "No usable data"
+        return "\n".join(formatted) if formatted else "No actionable tool results available."
 
     def _extract_json(self, response: str) -> str:
         """Extract JSON from LLM response"""
@@ -581,110 +572,3 @@ class CustomerSupportAgent:
             self._worker_started = True
             logger.info("✅ Background worker started")
     
-    @staticmethod
-    def get_workflow_stage_info() -> Dict[str, Dict[str, Any]]:
-        """Get information about all workflow stages for documentation/debugging"""
-        return {
-            "AIIntakeLayer": {
-                "description": "Initial sentiment analysis and categorization",
-                "tools": [],
-                "next_stages": ["DeEscalation", "SensitiveTask"],
-                "decision": "Check if customer needs de-escalation"
-            },
-            "DeEscalation": {
-                "description": "Handles frustrated/angry customers with empathy",
-                "tools": [],
-                "next_stages": ["SensitiveTask"],
-                "decision": "After calming, proceed to task classification"
-            },
-            "PreEscalationGathering": {
-                "description": "Gather info (photo/reason) before escalation",
-                "tools": [],
-                "next_stages": ["ComplianceVerification"],
-                "decision": "Ask for photo/reason, then proceed to verification"
-            },
-            "SensitiveTask": {
-                "description": "Decision: Refund/cancel/personal data?",
-                "tools": [],
-                "next_stages": ["PreEscalationGathering", "ComplianceVerification", "AIResolvable"],
-                "decision": "Check if info needed → PreEscalationGathering, else → ComplianceVerification"
-            },
-            "ComplianceVerification": {
-                "description": "Fraud check + image analysis for sensitive operations",
-                "tools": ["verification", "image_analysis", "assign_agent"],
-                "next_stages": ["SecureHandlingTeam"],
-                "decision": "Verify fraud risk + analyze image (if provided) + escalate to human"
-            },
-            "SecureHandlingTeam": {
-                "description": "Human handles verified sensitive operations",
-                "tools": ["assign_agent"],
-                "next_stages": ["PostResolution"],
-                "decision": "Human agent handles the case"
-            },
-            "AIResolvable": {
-                "description": "Decision: Can AI handle this?",
-                "tools": [],
-                "next_stages": ["AIAutoResponse", "ImmediateIssue"],
-                "decision": "AI can resolve → AIAutoResponse, else → ImmediateIssue"
-            },
-            "AIAutoResponse": {
-                "description": "AI provides information (order status, FAQs)",
-                "tools": ["live_information", "knowledge_base"],
-                "next_stages": ["InstantConfirmation"],
-                "decision": "Issue resolved by AI"
-            },
-            "InstantConfirmation": {
-                "description": "Quick resolution confirmation",
-                "tools": [],
-                "next_stages": ["PostResolution"],
-                "decision": "Confirm resolution and close"
-            },
-            "ImmediateIssue": {
-                "description": "Decision: Urgent or can wait?",
-                "tools": [],
-                "next_stages": ["AIAssistedRouting", "TicketCreation"],
-                "decision": "Urgent → AIAssistedRouting, else → TicketCreation"
-            },
-            "AIAssistedRouting": {
-                "description": "Urgent escalation to human agent",
-                "tools": ["assign_agent"],
-                "next_stages": ["LiveAgentAssist"],
-                "decision": "Route to available agent immediately"
-            },
-            "LiveAgentAssist": {
-                "description": "Human agent with AI assistance",
-                "tools": ["assign_agent"],
-                "next_stages": ["QuickResolution"],
-                "decision": "Agent resolves the issue"
-            },
-            "QuickResolution": {
-                "description": "Execute resolution (refund/replacement)",
-                "tools": ["order_action"],
-                "next_stages": ["PostResolution"],
-                "decision": "Action completed"
-            },
-            "TicketCreation": {
-                "description": "Create ticket for non-urgent issues",
-                "tools": ["raise_ticket"],
-                "next_stages": ["Investigation"],
-                "decision": "Ticket created for later investigation"
-            },
-            "Investigation": {
-                "description": "Background investigation (warehouse/courier)",
-                "tools": [],
-                "next_stages": ["FollowUp"],
-                "decision": "Investigation in progress"
-            },
-            "FollowUp": {
-                "description": "Proactive follow-up after resolution",
-                "tools": [],
-                "next_stages": ["PostResolution"],
-                "decision": "Follow up with customer"
-            },
-            "PostResolution": {
-                "description": "Final confirmation and feedback collection",
-                "tools": [],
-                "next_stages": [],
-                "decision": "Workflow complete"
-            }
-        }

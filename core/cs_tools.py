@@ -273,12 +273,13 @@ class KnowledgeBaseTool(BaseTool):
 class RaiseTicketTool(BaseTool):
     """Raise a support ticket in the system"""
     
-    def __init__(self, ticketing_api_url: str = None, api_key: str = None):
+    def __init__(self, base_url: str = None, business_id: str = None, api_key: str = None):
         super().__init__(
             "raise_ticket",
             "Create support ticket for non-urgent issues requiring investigation. Use for: problems needing research, warehouse/courier checks, complex issues that can wait. When issue cannot be resolved immediately but is not urgent."
         )
-        self.ticketing_api_url = ticketing_api_url
+        self.base_url = base_url
+        self.business_id = business_id
         self.api_key = api_key
         self.session = None
         
@@ -286,6 +287,7 @@ class RaiseTicketTool(BaseTool):
     
     async def execute(self, user_id: str, subject: str, description: str,
                      priority: str = "medium", category: str = "general",
+                     customerName: str = None, channel: str = "whatsapp",
                      metadata: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
         """
         Raise a support ticket
@@ -296,6 +298,8 @@ class RaiseTicketTool(BaseTool):
             description: Detailed description of the issue
             priority: Ticket priority - "low", "medium", "high", "urgent"
             category: Ticket category - "technical", "billing", "general", "product"
+            customerName: Name of the customer
+            channel: Communication channel - "whatsapp" or "website"
             metadata: Additional metadata (order_id, product_id, etc.)
         """
         self._record_usage()
@@ -314,12 +318,12 @@ class RaiseTicketTool(BaseTool):
             # - Return ticket details
             
             ticket = await self._create_ticket(
-                user_id, subject, description, priority, category, metadata
+                user_id, subject, description, priority, category, customerName, channel, metadata
             )
             
             return {
                 "success": True,
-                "ticket_id": ticket.get("ticket_id"),
+                "ticket_id": ticket.get("ticket_id") or ticket.get("id"),
                 "ticket": ticket,
                 "message": "Ticket created successfully"
             }
@@ -333,35 +337,49 @@ class RaiseTicketTool(BaseTool):
             }
     
     async def _create_ticket(self, user_id: str, subject: str, description: str,
-                           priority: str, category: str, 
-                           metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+                           priority: str, category: str, customerName: str = None, 
+                           channel: str = "whatsapp", metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """Create ticket in ticketing system"""
-        
-        # TODO: Implement actual ticket creation
-        # Example logic:
-        # 1. Format ticket data according to ticketing system API
-        # 2. Make POST request to create ticket
-        # 3. Handle response and extract ticket ID
-        # 4. Optionally send notification to user
-        # 5. Return ticket details
         
         logger.info(f"Creating ticket for user {user_id}: {subject}")
         
-        # Placeholder implementation
-        ticket_data = {
-            "ticket_id": "TICKET_PLACEHOLDER_12345",
-            "user_id": user_id,
+        # Construct the API request body
+        body = {
             "subject": subject,
             "description": description,
-            "priority": priority,
-            "category": category,
+            "customerId": user_id,
+            "customerName": customerName or "Unknown",
             "status": "open",
-            "created_at": datetime.now().isoformat(),
-            "metadata": metadata or {},
-            "message": "Ticket creation not yet fully implemented"
+            "priority": priority,
+            "tags": [category],
+            "channel": channel,
+            "assignee": None
         }
         
-        return ticket_data
+        # API endpoint
+        url = f"{self.base_url}/api/tickets/{self.business_id}"
+        
+        # Headers
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        # Make the POST request
+        async with self.session.post(url, headers=headers, json=body) as response:
+            if response.status == 201:  # Assuming 201 Created for successful ticket creation
+                result = await response.json()
+                logger.info(f"Ticket created successfully: {result.get('id')}")
+                return result
+            else:
+                error_text = await response.text()
+                logger.error(f"API error: {response.status} - {error_text}")
+                raise Exception(f"Failed to create ticket: {response.status} {error_text}")
+        
+        # Fallback (should not reach here)
+        return {
+            "ticket_id": "UNKNOWN",
+            "message": "Ticket creation failed"
+        }
     
     async def close(self):
         """Close HTTP session"""
@@ -1156,8 +1174,9 @@ class ToolManager:
         # Raise Ticket Tool
         ticket_config = self.config.get("raise_ticket", {})
         self.tools["raise_ticket"] = RaiseTicketTool(
-            ticketing_api_url=ticket_config.get("api_url"),
-            api_key=ticket_config.get("api_key")
+            base_url=ticket_config.get("base_url"),
+            business_id=ticket_config.get("business_id"),
+            api_key=None  # No API key needed for this endpoint
         )
         
         # Assign Agent Tool
