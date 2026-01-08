@@ -1174,8 +1174,8 @@ class ToolManager:
         # Raise Ticket Tool
         ticket_config = self.config.get("raise_ticket", {})
         self.tools["raise_ticket"] = RaiseTicketTool(
-            base_url=ticket_config.get("base_url"),
-            business_id=ticket_config.get("business_id"),
+            base_url=os.getenv("RAISE_TICKET_BASE_URL"),
+            business_id=os.getenv("BUSINESS_ID"),
             api_key=None  # No API key needed for this endpoint
         )
         

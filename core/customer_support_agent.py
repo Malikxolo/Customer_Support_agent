@@ -12,8 +12,7 @@ AVAILABLE TOOLS:
 - verification: Fraud check for sensitive operations
 - image_analysis: Analyze product photos for damage/defects
 - order_action: Process refunds, cancellations, replacements
-- assign_agent: Escalate to human agent
-- raise_ticket: Create support ticket for investigation
+- raise_ticket: Create support ticket for escalation (agent assigned in backend)
 """
 
 import json
@@ -70,16 +69,13 @@ class CustomerSupportAgent:
             "order_action": {
                 "purpose": "DO NOT USE - Bot cannot process refunds/cancels/replacements",
                 "use_when": "NEVER - these actions require human agent approval",
-                "important": "Always escalate to assign_agent for refund/cancel/replace requests"
-            },
-            "assign_agent": {
-                "purpose": "Connect customer with a human agent who can process refunds, replacements, etc.",
-                "use_when": "After gathering all info (order ID, reason, photos if applicable) for: refund requests, cancellations, replacements, complex issues",
-                "important": "NEVER use just because user says 'talk to agent' - first ask what their issue is. Gather all info before escalating."
+                "important": "Always escalate via raise_ticket for refund/cancel/replace requests"
             },
             "raise_ticket": {
-                "purpose": "Create support ticket for investigation",
-                "use_when": "Issue needs research (warehouse/courier checks) but is not urgent"
+                "purpose": "Create support ticket for escalation - an agent will be assigned in backend",
+                "use_when": "After gathering all info (order ID, reason, photos if applicable) for: refund requests, cancellations, replacements, complex issues, or issues needing research",
+                "important": "NEVER create ticket just because user says 'talk to agent' - first ask what their issue is. Gather all info before creating ticket.",
+                "required_params": "subject (brief title), description (full issue details with order_id if available)"
             }
         }
         
@@ -310,9 +306,12 @@ Think through these steps naturally:
    
    What's needed for different requests:
    - For refund/cancellation → order ID + reason (need BOTH)
-   - For damaged item → photo + description of damage
-   - For wrong item → photo + what they received vs expected
-   - For "I want to talk to agent" with NO context → what issue they're facing
+   - For damaged item → order ID + photo + description of damage (need ALL)
+   - For wrong item → order ID + photo + what they received vs expected
+   - For escalation/talk to agent → order ID + clear issue description (need BOTH)
+   - For "I want to talk to agent" with NO context → what issue they're facing + order ID
+   
+   IMPORTANT: You CANNOT create a ticket without order_id. Always ask for it if missing.
    
    If ALL required info is available (from current message + history), then proceed.
 
@@ -324,9 +323,9 @@ Think through these steps naturally:
    - Non-urgent issue needing research → raise_ticket
 
 5. SPECIAL CASES
-   - Customer asks for human BUT has already explained issue and we couldn't help → assign_agent
+   - Customer asks for human BUT has already explained issue and we couldn't help → raise_ticket
    - Customer asks for human WITHOUT explaining issue → Ask what's wrong first (needs_more_info=true)
-   - High-risk verification result → assign_agent
+   - High-risk verification result → raise_ticket
    - Simple greeting or thanks → no tools needed
 
 === TOOL SELECTION RULES ===
@@ -335,23 +334,22 @@ Information-gathering tools (can run together):
    - live_information, knowledge_base, verification, image_analysis
 
 Commitment tools (require user confirmation FIRST):
-   - assign_agent → ONLY use when user explicitly confirms they want an agent
+   - raise_ticket → ONLY use when user explicitly confirms they want escalation. Creates ticket and agent is assigned in backend.
    - order_action → ONLY after verification passes
-   - raise_ticket → creates a permanent record
    
-ABSOLUTE RULE FOR ASSIGN_AGENT (HARD CONSTRAINT):
+ABSOLUTE RULE FOR RAISE_TICKET (HARD CONSTRAINT):
 
-assign_agent is NOT a problem-solving step.
-assign_agent is a permission-based action.
+raise_ticket is NOT a problem-solving step.
+raise_ticket is a permission-based action.
 
-You MUST NOT include "assign_agent" in tools_to_use
+You MUST NOT include "raise_ticket" in tools_to_use
 unless the user has explicitly requested or confirmed
-that they want to talk to a human agent
+that they want to escalate to a human agent
 in their CURRENT message.
 
 If escalation seems appropriate but the user has NOT confirmed:
-- Do NOT select assign_agent
-- Ask the user if they want to be connected to an agent
+- Do NOT select raise_ticket
+- Ask the user if they want to escalate this to our support team
 - Wait for their response in the next turn
 
 
@@ -373,6 +371,12 @@ Return your analysis as JSON:
   "tools_to_use": ["tool1", "tool2"] or empty array if no tools needed,
   "tool_queries": {{
     "tool_name": "specific query to pass to this tool"
+  }},
+  "tool_parameters": {{
+    "raise_ticket": {{
+      "subject": "brief ticket title based on issue",
+      "description": "detailed description including order_id, issue, customer request"
+    }}
   }},
   "reasoning": "your decision logic: what user wants, why you chose these tools, what should happen next"
 }}"""
@@ -417,6 +421,7 @@ Return your analysis as JSON:
         results = {}
         tasks = []
         tool_queries = analysis.get('tool_queries', {})
+        tool_parameters = analysis.get('tool_parameters', {})
         
         for i, tool in enumerate(tools):
             if tool not in self.available_tools:
@@ -426,8 +431,11 @@ Return your analysis as JSON:
             tool_key = f"{tool}_{i}"
             tool_query = tool_queries.get(tool, query)
             
+            # Get tool-specific parameters if provided by LLM
+            extra_params = tool_parameters.get(tool, {})
+            
             logger.info(f"🔧 Queueing {tool}: '{tool_query[:50]}...'")
-            task = self.tool_manager.execute_tool(tool, query=tool_query, user_id=user_id)
+            task = self.tool_manager.execute_tool(tool, query=tool_query, user_id=user_id, **extra_params)
             tasks.append((tool_key, task))
         
         # Execute all in parallel
@@ -523,8 +531,7 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
 4. USING TOOL RESULTS:
    - If verification done → mention you've verified their request
    - If image analyzed → reference what was found
-   - If agent assigned → confirm help is on the way with ETA
-   - If ticket created → give them the ticket number and timeline
+   - If ticket created → give them the ticket number and confirm an agent will reach out
    - If order/policy info retrieved → answer their question directly
 
 5. HANDLE TOOL ERRORS:
@@ -535,14 +542,18 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
      Wait until image is successfully analyzed before offering to connect with an agent.
 
 6. OFFERING ESCALATION:
-   Check if agent was already assigned (look for "AGENT ASSIGNED" in tool results):
+   Check if ticket was already created (look for "TICKET CREATED" in tool results):
    
-   - If AGENT ASSIGNED appears in tool results:
-     → Agent is already connected. Confirm help is on the way with ETA.
+   - If TICKET CREATED appears in tool results:
+     → Ticket is created. Confirm an agent will reach out shortly with the ticket reference.
    
-   - If NO agent assigned yet AND verification was done:
-     → ASK user: "Would you like me to connect you with an agent who can help with your [refund/replacement/etc]?"
-     → Wait for their confirmation before actually assigning.
+   - If raise_ticket shows ERROR or failed:
+     → Do NOT say you escalated or created a ticket. That's a lie.
+     → Apologize for the technical issue and say you'll try again, or ask for any missing info.
+   
+   - If NO ticket created yet AND verification was done:
+     → ASK user: "Would you like me to escalate this to our support team? An agent will reach out to help with your [refund/replacement/etc]."
+     → Wait for their confirmation before creating ticket.
    
    - If explicit_request is null/None (customer is vague):
      → Ask what they need help with, or if just sharing feedback.
@@ -552,8 +563,8 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
 
 7. BOT LIMITATIONS:
    - Bot CANNOT process refunds, cancellations, or replacements directly
-   - For these requests: gather info → verify → ASK if they want agent → then connect
-   - Never say "I'll process the refund" - say "Would you like me to connect you with an agent who can help?"
+   - For these requests: gather info → verify → ASK if they want to escalate → then create ticket
+   - Never say "I'll process the refund" - say "Would you like me to escalate this to our support team?"
 
 8. FORMAT:
    - Keep responses extremely short: 1 sentence for most answers within 10-20 wods. Only 2 sentences if absolutely necessary. Be direct and helpful.
@@ -654,15 +665,6 @@ Generate your response:"""
                 if ai_detection.get('is_ai_generated'):
                     formatted.append("  ⚠️ Warning: Image may be AI-generated")
             
-            elif tool_name == "assign_agent":
-                agent_info = result.get('agent_info', {})
-                formatted.append("👤 AGENT ASSIGNED:")
-                formatted.append(f"  • Agent: {agent_info.get('agent_name', 'Support Specialist')}")
-                formatted.append(f"  • ETA: {result.get('eta', '5-10 minutes')}")
-                formatted.append(f"  • Channel: {result.get('channel', 'chat')}")
-                if result.get('assignment_id'):
-                    formatted.append(f"  • Reference: {result.get('assignment_id')}")
-            
             elif tool_name == "raise_ticket":
                 formatted.append("🎫 TICKET CREATED:")
                 formatted.append(f"  • Ticket ID: {result.get('ticket_id', 'N/A')}")
@@ -670,6 +672,7 @@ Generate your response:"""
                 formatted.append(f"  • Priority: {result.get('priority', 'medium')}")
                 if result.get('category'):
                     formatted.append(f"  • Category: {result.get('category')}")
+                formatted.append("  • An agent will be assigned and will reach out shortly")
             
             elif tool_name == "order_action":
                 action = result.get('action', 'unknown')
