@@ -165,7 +165,8 @@ async def lifespan(app: FastAPI):
     agent = CustomerSupportAgent(
         brain_llm=customer_bot_analysis_llm,
         heart_llm=customer_bot_response_llm,
-        tool_manager=cs_tool_manager
+        tool_manager=cs_tool_manager,
+        language_detector_llm=language_detector_llm
     )
     logging.info("✅ CustomerSupportAgent initialized")
     

@@ -32,10 +32,11 @@ logger = logging.getLogger(__name__)
 class CustomerSupportAgent:
     """Intelligent customer support agent with minimal LLM calls"""
     
-    def __init__(self, brain_llm, heart_llm, tool_manager):
+    def __init__(self, brain_llm, heart_llm, tool_manager, language_detector_llm=None):
         self.brain_llm = brain_llm  # For analysis
         self.heart_llm = heart_llm  # For response generation
         self.tool_manager = tool_manager
+        self.language_detector_llm = language_detector_llm  # For language detection
         self.available_tools = tool_manager.get_available_tools()
         self.tool_descriptions = self._get_tool_descriptions()
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
@@ -97,6 +98,94 @@ class CustomerSupportAgent:
         
         return "\n".join(formatted)
     
+    async def _detect_and_translate(self, query: str, chat_history: List[Dict] = None) -> Dict[str, str]:
+        """Detect language and translate to English if needed"""
+        
+        # If no language detector, default to English
+        if not self.language_detector_llm:
+            return {
+                "detected_language": "english",
+                "english_translation": query,
+                "original_query": query
+            }
+        
+        # Format chat history for context
+        formatted_history = ""
+        if chat_history:
+            history_entries = []
+            for msg in chat_history[-4:]:  # Last 4 messages for context
+                role = msg.get('role', 'unknown').upper()
+                content = msg.get('content', '')
+                history_entries.append(f"{role}: {content}")
+            formatted_history = "\n".join(history_entries)
+        
+        detection_prompt = f"""Analyze this query and identify its language, then translate if needed.
+
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history if formatted_history else 'No previous conversation.'}
+
+CURRENT QUERY: "{query}"
+
+YOUR TASK:
+1. Identify what language this query is written in
+2. Be specific with your language detection:
+   - If it's Roman/Latin script with Hindi vocabulary → "hinglish"
+   - If it's Devanagari script → "hindi"
+   - If it's pure English → "english"
+   - For other languages, identify accurately (malayalam, tamil, telugu, etc.)
+   - If romanized script of any Indian language → add "_romanized" (e.g., "malayalam_romanized")
+
+3. If the query is NOT in English, translate it to English while preserving the exact meaning and intent
+4. If already in English, keep it as is
+
+Think naturally using your language understanding. No pattern matching, no hardcoded rules.
+
+Return ONLY valid JSON:
+{{
+  "detected_language": "<language name or language_romanized>",
+  "english_translation": "<English version or original if already English>"
+}}
+
+Examples:
+- "kya kiya aaj?" → {{"detected_language": "hinglish", "english_translation": "what did you do today?"}}
+- "what's the weather?" → {{"detected_language": "english", "english_translation": "what's the weather?"}}
+- "क्या हाल है?" → {{"detected_language": "hindi", "english_translation": "how are you?"}}
+"""
+        
+        try:
+            logger.info(f"🌍 LANGUAGE DETECTION: Analyzing query...")
+            
+            response = await self.language_detector_llm.generate(
+                messages=[{"role": "user", "content": detection_prompt}],
+                system_prompt="You are a language detection expert. Analyze queries and return JSON only.",
+                temperature=0.1,
+                max_tokens=200
+            )
+            
+            # Extract JSON from response
+            json_str = self._extract_json(response)
+            result = json.loads(json_str)
+            
+            detected_lang = result.get('detected_language', 'english')
+            english_query = result.get('english_translation', query)
+            
+            logger.info(f"🌍 DETECTED LANGUAGE: {detected_lang}")
+            logger.info(f"📝 ENGLISH TRANSLATION: {english_query}")
+            
+            return {
+                "detected_language": detected_lang,
+                "english_translation": english_query,
+                "original_query": query
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Language detection failed: {e}, defaulting to English")
+            return {
+                "detected_language": "english",
+                "english_translation": query,
+                "original_query": query
+            }
+    
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
         """Process customer query with minimal LLM calls"""
         self._start_worker_if_needed()
@@ -104,14 +193,22 @@ class CustomerSupportAgent:
         start_time = datetime.now()
         
         try:
-            # Step 1: Analyze query (1 LLM call)
+            # Step 0: Language detection and translation
+            language_detection_start = datetime.now()
+            language_info = await self._detect_and_translate(query, chat_history)
+            detected_language = language_info.get('detected_language', 'english')
+            english_query = language_info.get('english_translation', query)
+            language_detection_time = (datetime.now() - language_detection_start).total_seconds()
+            
+            logger.info(f"🌍 Language: {detected_language}, English query: '{english_query}'")
+            
+            # Step 1: Analyze query (1 LLM call) - use English translation
             analysis_start = datetime.now()
-            analysis = await self._analyze_query(query, chat_history)
+            analysis = await self._analyze_query(english_query, chat_history)
             analysis_time = (datetime.now() - analysis_start).total_seconds()
             
             # Log analysis details
             logger.info(f"📊 ANALYSIS RESULTS:")
-            logger.info(f"   Language: {analysis.get('language', 'en')}")
             logger.info(f"   Intent: {analysis.get('intent', 'Unknown')}")
             logger.info(f"   Sentiment: {analysis.get('sentiment', {})}")
             logger.info(f"   Needs De-escalation: {analysis.get('needs_de_escalation', False)}")
@@ -129,24 +226,26 @@ class CustomerSupportAgent:
                 tool_time = 0.0
             else:
                 tool_start = datetime.now()
-                tool_results = await self._execute_tools(tools_to_use, query, analysis, user_id)
+                tool_results = await self._execute_tools(tools_to_use, english_query, analysis, user_id)
                 tool_time = (datetime.now() - tool_start).total_seconds()
             
-            # Step 3: Generate response (1 LLM call)
+            # Step 3: Generate response (1 LLM call) - pass detected language and English query
             response_start = datetime.now()
-            final_response = await self._generate_response(query, analysis, tool_results, chat_history)
+            final_response = await self._generate_response(english_query, analysis, tool_results, chat_history, detected_language)
             response_time = (datetime.now() - response_start).total_seconds()
             
             total_time = (datetime.now() - start_time).total_seconds()
-            logger.info(f"✅ COMPLETED in {total_time:.2f}s (2 LLM calls)")
+            logger.info(f"✅ COMPLETED in {total_time:.2f}s (3 LLM calls: detection + analysis + response)")
             
             return {
                 "success": True,
                 "response": final_response,
                 "analysis": analysis,
+                "language": detected_language,
                 "tool_results": tool_results,
                 "tools_used": tools_to_use,
                 "processing_time": {
+                    "language_detection": language_detection_time,
                     "analysis": analysis_time,
                     "tools": tool_time,
                     "response": response_time,
@@ -193,9 +292,6 @@ AVAILABLE TOOLS:
 Think through these steps naturally:
 
 1. UNDERSTAND THE CUSTOMER
-   - What language and writing style are they using?
-     (Detect whether the customer is using native script or romanized writing.
-     You must respond in the same language and writing style.)
    - How are they feeling? (angry, frustrated, confused, calm, satisfied)
    - How urgent is their issue?
    - If very angry/frustrated with high intensity → they need de-escalation (empathy first)
@@ -205,24 +301,26 @@ Think through these steps naturally:
    - Is this a follow-up to previous conversation? Check history for context.
 
 3. DO YOU NEED MORE INFORMATION?
-   Consider if you're missing critical info to help them:
-   - For refund/cancellation → Do you have the order ID? What's the reason?
-   - For damaged item → Do you have a photo? Do you know what happened?
-   - For wrong item → Do you have a photo? What did they receive vs expect?
-   - For expired/spoiled product → Ask for photo showing expiry date or product condition
-   - For "I want to talk to agent" with NO context → Ask what issue they're facing first!
+   FIRST: Check conversation history for info already provided.
    
-   IMPORTANT: If user just says "I want agent" or "talk to human" but hasn't explained their problem:
-   → Set needs_more_info=true, missing_info="what issue they need help with"
-   → Do NOT assign agent yet - we need to understand and try to help first
+   CRITICAL: If you previously asked for MULTIPLE pieces of info, verify ALL were provided.
+   - If you asked for "order ID AND reason" → user must provide BOTH, not just one
+   - If user only provided partial info → still mark needs_more_info=true for the remaining items
+   - Do NOT proceed until you have everything you asked for
    
-   If missing essential info → set needs_more_info=true and specify what's missing
+   What's needed for different requests:
+   - For refund/cancellation → order ID + reason (need BOTH)
+   - For damaged item → photo + description of damage
+   - For wrong item → photo + what they received vs expected
+   - For "I want to talk to agent" with NO context → what issue they're facing
+   
+   If ALL required info is available (from current message + history), then proceed.
 
 4. SELECT TOOLS (only if you have enough info)
    - Order status/tracking questions → live_information
    - Policy/FAQ questions → knowledge_base  
-   - Refund/cancel/replace requests → verification first, then assign_agent (bot CANNOT process these, agent must)
-   - Damaged product with photo → image_analysis + verification, then OFFER agent in response (don't auto-assign)
+   - Refund/cancel/replace requests → verification ONLY (then offer agent in response, don't auto-assign)
+   - Damaged product with photo → image_analysis + verification (then offer agent in response)
    - Non-urgent issue needing research → raise_ticket
 
 5. SPECIAL CASES
@@ -233,32 +331,35 @@ Think through these steps naturally:
 
 === TOOL SELECTION RULES ===
 
-Some tools are "information-gathering" and can run together:
+Information-gathering tools (can run together):
    - live_information, knowledge_base, verification, image_analysis
 
-Some tools are "commitment actions" - only use when you have enough verified info:
-   - assign_agent → commits a human agent's time
-   - order_action → commits to refund/cancel/replace
+Commitment tools (require user confirmation FIRST):
+   - assign_agent → ONLY use when user explicitly confirms they want an agent
+   - order_action → ONLY after verification passes
    - raise_ticket → creates a permanent record
+   
+ABSOLUTE RULE FOR ASSIGN_AGENT (HARD CONSTRAINT):
 
-IMPORTANT FOR DAMAGE CLAIMS:
-   - When customer provides photo for damage → Use [image_analysis, verification] ONLY
-   - Do NOT include assign_agent in the same turn
-   - Wait for image analysis result, then in the NEXT turn:
-     • If damage confirmed → Offer to connect with agent (response asks "would you like me to connect you with an agent?")
-     • If image error/failed → Ask for clearer photo (no agent needed yet)
-     • If no damage found → Tell user, offer escalation if they insist
-   - Only use assign_agent when:
-     • Customer confirms they want agent AFTER we offered (based on verified issue)
-     • Customer already explained issue in previous turns AND we couldn't resolve it AND they ask for human
-   - Do NOT use assign_agent just because user says "talk to agent" without explaining their problem first
+assign_agent is NOT a problem-solving step.
+assign_agent is a permission-based action.
+
+You MUST NOT include "assign_agent" in tools_to_use
+unless the user has explicitly requested or confirmed
+that they want to talk to a human agent
+in their CURRENT message.
+
+If escalation seems appropriate but the user has NOT confirmed:
+- Do NOT select assign_agent
+- Ask the user if they want to be connected to an agent
+- Wait for their response in the next turn
+
 
 Return your analysis as JSON:
 
 {{
-  "language": "detected language",
-  "writing_style": "native script or romanized (based on how the customer writes)",
   "intent": "brief description of what customer wants",
+  "explicit_request": "what specific action customer asked for (refund/replacement/cancel/reorder/status/etc) or null if vague",
   "sentiment": {{
     "emotion": "angry|frustrated|confused|neutral|satisfied|urgent",
     "intensity": "low|medium|high",
@@ -268,11 +369,12 @@ Return your analysis as JSON:
   "de_escalation_approach": "how to acknowledge their feelings if needed, or empty string",
   "needs_more_info": true or false,
   "missing_info": "what specific info is needed (order_id, photo, reason, details) or null if none",
+  "context_from_history": "any relevant info already provided in earlier messages (order_id, reason, etc) or null",
   "tools_to_use": ["tool1", "tool2"] or empty array if no tools needed,
   "tool_queries": {{
     "tool_name": "specific query to pass to this tool"
   }},
-  "reasoning": "brief explanation of your decision"
+  "reasoning": "your decision logic: what user wants, why you chose these tools, what should happen next"
 }}"""
 
         try:
@@ -296,7 +398,6 @@ Return your analysis as JSON:
     def _get_fallback_analysis(self, query: str) -> Dict[str, Any]:
         """Fallback analysis when parsing fails"""
         return {
-            "language": "en",
             "intent": query,
             "sentiment": {"emotion": "neutral", "intensity": "medium", "urgency": "medium"},
             "needs_de_escalation": False,
@@ -341,14 +442,14 @@ Return your analysis as JSON:
         return results
     
     async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, 
-                                 chat_history: List[Dict]) -> str:
+                                 chat_history: List[Dict], detected_language: str = "english") -> str:
         """Generate customer support response"""
         
         # Format chat history
         formatted_history = ""
         if chat_history:
             history_entries = []
-            for msg in chat_history[-10:]:
+            for msg in chat_history[-4:]:
                 role = msg.get('role', 'unknown').upper()
                 content = msg.get('content', '')
                 history_entries.append(f"{role}: {content}")
@@ -364,20 +465,23 @@ Return your analysis as JSON:
         logger.info("="*60)
         
         # Extract analysis data
-        language = analysis.get('language', 'en')
         sentiment = analysis.get('sentiment', {})
         needs_de_escalation = analysis.get('needs_de_escalation', False)
         de_escalation_approach = analysis.get('de_escalation_approach', '')
         needs_more_info = analysis.get('needs_more_info', False)
         missing_info = analysis.get('missing_info')
+        intent = analysis.get('intent', '')
+        explicit_request = analysis.get('explicit_request')
+        reasoning = analysis.get('reasoning', '')
+        context_from_history = analysis.get('context_from_history')
+        
         
         response_prompt = f"""You are a friendly, helpful customer support agent. Generate a response to help this customer.
 
 CUSTOMER QUERY: {query}
 
-RESPOND IN:
-- Language: {language}
-- Writing style: {analysis.get('writing_style', 'same as customer')}
+RESPOND IN LANGUAGE: {detected_language}
+(This is the language the customer used. You MUST respond in this exact language.)
 
 CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
 {formatted_history if formatted_history else 'No previous conversation.'}
@@ -388,6 +492,12 @@ CUSTOMER STATE:
 - Urgency: {sentiment.get('urgency', 'medium')}
 - Needs de-escalation: {needs_de_escalation}
 
+ANALYSIS CONTEXT:
+- Intent: {intent}
+- Explicit Request: {explicit_request if explicit_request else 'None - customer is vague about what they want'}
+- Context from History: {context_from_history if context_from_history else 'None'}
+- Reasoning: {reasoning}
+
 INFORMATION FROM TOOLS:
 {tool_data}
 
@@ -395,9 +505,12 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
 
 === RESPONSE GUIDELINES ===
 
-1. LANGUAGE MIRRORING:
-   You MUST mirror both the customer's language AND their writing style exactly.
-   If the customer uses romanized or mixed script, respond the same way.
+1. LANGUAGE REQUIREMENT:
+   You MUST respond in: {detected_language}
+   This is the language the customer used in their original query.
+   If it's "hinglish", use romanized Hindi mixed with English.
+   If it's a language with "_romanized" suffix, use romanized script.
+   Match the customer's language exactly.
 
 2. DE-ESCALATION (if needed = {needs_de_escalation}):
    Start with empathy. Approach: {de_escalation_approach if de_escalation_approach else 'Acknowledge their frustration, show you understand'}
@@ -421,18 +534,26 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
    - IMPORTANT: If image_analysis failed, focus ONLY on getting a proper image. Do NOT offer agent connection yet.
      Wait until image is successfully analyzed before offering to connect with an agent.
 
-6. OFFERING ESCALATION (only if needs_more_info = False AND you have all the info):
-   When ready to escalate, give two options:
-   - Option 1: Connect with agent (for refunds, replacements, complex issues)
-   - Option 2: Just sharing feedback (no agent needed, thank them)
-   Example: "Would you like me to connect you with an agent to help with this, or were you just sharing feedback?"
+6. OFFERING ESCALATION:
+   Check if agent was already assigned (look for "AGENT ASSIGNED" in tool results):
    
-   IMPORTANT: If needs_more_info = True, do NOT offer escalation yet. Just ask for the missing info.
+   - If AGENT ASSIGNED appears in tool results:
+     → Agent is already connected. Confirm help is on the way with ETA.
+   
+   - If NO agent assigned yet AND verification was done:
+     → ASK user: "Would you like me to connect you with an agent who can help with your [refund/replacement/etc]?"
+     → Wait for their confirmation before actually assigning.
+   
+   - If explicit_request is null/None (customer is vague):
+     → Ask what they need help with, or if just sharing feedback.
+   
+   - If needs_more_info = True:
+     → Do NOT offer escalation. Just ask for the missing info.
 
 7. BOT LIMITATIONS:
    - Bot CANNOT process refunds, cancellations, or replacements directly
-   - For these requests: gather info → verify → then offer to connect with agent
-   - Never say "I'll process the refund" - say "I can connect you with an agent who can help with your refund"
+   - For these requests: gather info → verify → ASK if they want agent → then connect
+   - Never say "I'll process the refund" - say "Would you like me to connect you with an agent who can help?"
 
 8. FORMAT:
    - Keep responses extremely short: 1 sentence for most answers within 10-20 wods. Only 2 sentences if absolutely necessary. Be direct and helpful.
