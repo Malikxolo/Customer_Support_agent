@@ -193,7 +193,9 @@ AVAILABLE TOOLS:
 Think through these steps naturally:
 
 1. UNDERSTAND THE CUSTOMER
-   - What language are they writing in? (You must respond in the same language)
+   - What language and writing style are they using?
+     (Detect whether the customer is using native script or romanized writing.
+     You must respond in the same language and writing style.)
    - How are they feeling? (angry, frustrated, confused, calm, satisfied)
    - How urgent is their issue?
    - If very angry/frustrated with high intensity → they need de-escalation (empathy first)
@@ -203,6 +205,15 @@ Think through these steps naturally:
    - Is this a follow-up to previous conversation? Check history for context.
 
 3. DO YOU NEED MORE INFORMATION?
+   CRITICAL - CHECK CONVERSATION HISTORY FIRST:
+   Before marking anything as missing_info, review the CONVERSATION HISTORY above:
+   - If user mentioned order ID in previous turns → Use it, don't ask again
+   - If user already explained their issue → Don't ask them to repeat it
+   - If user already stated what they want (refund/cancel/etc.) → Acknowledge it
+   
+   ONLY mark as missing_info if information was NEVER mentioned in the conversation.
+   If customer is repeating information they already gave → They're frustrated, proceed with info from history.
+   
    Consider if you're missing critical info to help them:
    - For refund/cancellation → Do you have the order ID? What's the reason?
    - For damaged item → Do you have a photo? Do you know what happened?
@@ -214,7 +225,7 @@ Think through these steps naturally:
    → Set needs_more_info=true, missing_info="what issue they need help with"
    → Do NOT assign agent yet - we need to understand and try to help first
    
-   If missing essential info → set needs_more_info=true and specify what's missing
+   If missing essential info that was NEVER mentioned in conversation → set needs_more_info=true and specify what's missing
 
 4. SELECT TOOLS (only if you have enough info)
    - Order status/tracking questions → live_information
@@ -254,7 +265,8 @@ IMPORTANT FOR DAMAGE CLAIMS:
 Return your analysis as JSON:
 
 {{
-  "language": "detected language code (en, es, fr, ar, de, etc.)",
+  "language": "detected language",
+  "writing_style": "native script or romanized (based on how the customer writes)",
   "intent": "brief description of what customer wants",
   "sentiment": {{
     "emotion": "angry|frustrated|confused|neutral|satisfied|urgent",
@@ -264,7 +276,7 @@ Return your analysis as JSON:
   "needs_de_escalation": true or false,
   "de_escalation_approach": "how to acknowledge their feelings if needed, or empty string",
   "needs_more_info": true or false,
-  "missing_info": "what specific info is needed (order_id, photo, reason, details) or null if none",
+  "missing_info": "what specific info is needed that was NEVER mentioned in conversation history (order_id, photo, reason, details) or null if none. CHECK HISTORY FIRST - don't ask for info already provided in previous turns",
   "tools_to_use": ["tool1", "tool2"] or empty array if no tools needed,
   "tool_queries": {{
     "tool_name": "specific query to pass to this tool"
@@ -372,7 +384,9 @@ Return your analysis as JSON:
 
 CUSTOMER QUERY: {query}
 
-RESPOND IN THIS LANGUAGE: {language}
+RESPOND IN:
+- Language: {language}
+- Writing style: {analysis.get('writing_style', 'same as customer')}
 
 CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
 {formatted_history if formatted_history else 'No previous conversation.'}
@@ -390,7 +404,9 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
 
 === RESPONSE GUIDELINES ===
 
-1. LANGUAGE: You MUST respond in {language}. Mirror the customer's language exactly.
+1. LANGUAGE MIRRORING:
+   You MUST mirror both the customer's language AND their writing style exactly.
+   If the customer uses romanized or mixed script, respond the same way.
 
 2. DE-ESCALATION (if needed = {needs_de_escalation}):
    Start with empathy. Approach: {de_escalation_approach if de_escalation_approach else 'Acknowledge their frustration, show you understand'}
@@ -414,11 +430,23 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
    - IMPORTANT: If image_analysis failed, focus ONLY on getting a proper image. Do NOT offer agent connection yet.
      Wait until image is successfully analyzed before offering to connect with an agent.
 
-6. OFFERING ESCALATION (only if needs_more_info = False AND you have all the info):
-   When ready to escalate, give two options:
-   - Option 1: Connect with agent (for refunds, replacements, complex issues)
-   - Option 2: Just sharing feedback (no agent needed, thank them)
-   Example: "Would you like me to connect you with an agent to help with this, or were you just sharing feedback?"
+6. ESCALATION BEHAVIOR (only if needs_more_info = False AND you have all the info):
+   
+   CONTEXT ACKNOWLEDGMENT:
+   When using information from earlier in conversation (order ID, issue details):
+   → Acknowledge it naturally: "Based on order [X] you mentioned earlier..." or "For the [issue] you described..."
+   → This shows you're listening and prevents user from feeling they have to repeat themselves
+   
+   WHEN TO ASK "AGENT OR FEEDBACK?":
+   - If user clearly stated what they want (refund, cancel, replace, specific issue):
+     → DON'T ask "agent or feedback?" - they already told you what they need
+     → Directly connect: "I'm connecting you with an agent who can help with [their specific request]"
+   
+   - If user's intent is UNCLEAR or they just said "I need help" without specifying:
+     → THEN it's okay to ask: "Would you like me to connect you with an agent to help with this, or were you just sharing feedback?"
+   
+   - NEVER offer "feedback" option during active issue resolution (damaged item, missing order, complaint)
+     → Only offer feedback AFTER issue is resolved or when conversation is clearly ending
    
    IMPORTANT: If needs_more_info = True, do NOT offer escalation yet. Just ask for the missing info.
 
