@@ -60,7 +60,11 @@ class CustomerSupportAgent:
             "last_bot_question": None,
             "missing_info_requested": [],
             "ticket_attempted": False,
-            "ticket_created": False
+            "ticket_created": False,
+            "out_of_scope_detected": False,
+            "out_of_scope_topic": None,
+            "info_refused": {},
+            "times_asked_for_info": {}
         }
         
         if not chat_history:
@@ -127,18 +131,49 @@ class CustomerSupportAgent:
                 if 'name' in content and ('provide' in content or 'share' in content or 'tell' in content or '?' in content):
                     state["missing_info_requested"].append("customer_name")
                     state["last_bot_question"] = "asked_for_info"
+                    state["times_asked_for_info"]["customer_name"] = state["times_asked_for_info"].get("customer_name", 0) + 1
                 if 'phone' in content and ('provide' in content or 'share' in content or 'tell' in content or '?' in content):
                     state["missing_info_requested"].append("phone_number")
                     state["last_bot_question"] = "asked_for_info"
+                    state["times_asked_for_info"]["phone_number"] = state["times_asked_for_info"].get("phone_number", 0) + 1
                 if 'order' in content and ('id' in content or 'number' in content) and '?' in content:
                     state["missing_info_requested"].append("order_id")
                     state["last_bot_question"] = "asked_for_info"
+                    state["times_asked_for_info"]["order_id"] = state["times_asked_for_info"].get("order_id", 0) + 1
                 
                 # Detect ticket creation attempt
                 if 'technical issue' in content or 'try again' in content:
                     state["ticket_attempted"] = True
                 if 'ticket' in content and ('created' in content or 'raised' in content):
                     state["ticket_created"] = True
+                
+                # Detect out-of-scope responses from bot
+                if any(phrase in content for phrase in [
+                    'outside what i can help',
+                    'outside my scope',
+                    'outside of my scope',
+                    'not something i can assist',
+                    'beyond my capabilities',
+                    'unable to help with'
+                ]):
+                    state["out_of_scope_detected"] = True
+            
+            # Detect user refusals in user messages
+            if role == 'user':
+                refusal_patterns = [
+                    (r"(?:i\s+)?(?:don'?t|do not|dont)\s+(?:have|remember|know)\s+(?:my\s+)?(?:the\s+)?order", "order_id"),
+                    (r"(?:i\s+)?(?:don'?t|do not|dont)\s+(?:have|remember|know)\s+(?:my\s+)?(?:the\s+)?phone", "phone_number"),
+                    (r"(?:i\s+)?(?:don'?t|do not|dont)\s+(?:have|remember|know)\s+(?:my\s+)?(?:the\s+)?name", "customer_name"),
+                    (r"(?:i\s+)?(?:can'?t|cannot|cant)\s+(?:provide|give|share|tell)", "general"),
+                    (r"(?:i\s+)?(?:don'?t|do not|dont)\s+(?:want to|wanna)\s+(?:provide|give|share|tell)", "general"),
+                    (r"(?:i\s+)?(?:won'?t|will not|wont)\s+(?:provide|give|share|tell)", "general"),
+                    (r"(?:not willing to|refuse to)\s+(?:provide|give|share)", "general"),
+                    (r"(?:i\s+)?(?:don'?t|do not|dont)\s+have\s+(?:any\s+)?(?:image|photo|picture)", "image"),
+                    (r"(?:i\s+)?(?:can'?t|cannot|cant)\s+(?:send|share|upload)\s+(?:any\s+)?(?:image|photo|picture)", "image")
+                ]
+                for pattern, info_type in refusal_patterns:
+                    if re.search(pattern, content, re.IGNORECASE):
+                        state["info_refused"][info_type] = True
         
         # Determine pending action
         if state["escalation_confirmed"] and not state["ticket_created"]:
@@ -193,10 +228,32 @@ class CustomerSupportAgent:
         if state.get("ticket_created"):
             lines.append("TICKET STATUS: Already created")
         
+        # Out-of-scope detection
+        if state.get("out_of_scope_detected"):
+            lines.append("OUT-OF-SCOPE: Bot already identified query as out-of-scope")
+        
+        # Info refusal tracking
+        if state.get("info_refused"):
+            refused_items = [k for k, v in state["info_refused"].items() if v]
+            if refused_items:
+                lines.append(f"INFO REFUSED BY USER: {', '.join(refused_items)}")
+        
+        # Times asked tracking
+        if state.get("times_asked_for_info"):
+            asked_counts = [f"{k}({v}x)" for k, v in state["times_asked_for_info"].items() if v > 0]
+            if asked_counts:
+                lines.append(f"TIMES BOT ASKED FOR INFO: {', '.join(asked_counts)}")
+        
         # Add guidance based on state
         lines.append("")
         lines.append("STATE INTERPRETATION:")
-        if state.get("escalation_confirmed") and pending == "raise_ticket":
+        if state.get("out_of_scope_detected"):
+            lines.append("→ This query was already identified as OUT OF SCOPE. Keep politely declining.")
+        elif state.get("info_refused"):
+            refused = [k for k, v in state["info_refused"].items() if v]
+            if refused:
+                lines.append(f"→ User REFUSED to provide: {', '.join(refused)}. Do NOT ask again. Explain you cannot proceed.")
+        elif state.get("escalation_confirmed") and pending == "raise_ticket":
             lines.append("→ User ALREADY confirmed escalation. Proceed with raise_ticket if you have all required info.")
         elif state.get("escalation_offered") and not state.get("escalation_confirmed"):
             lines.append("→ Bot offered escalation but user hasn't confirmed yet.")
@@ -368,10 +425,15 @@ Examples:
             # Log analysis details
             logger.info(f"📊 ANALYSIS RESULTS:")
             logger.info(f"   Intent: {analysis.get('intent', 'Unknown')}")
+            logger.info(f"   Is In Scope: {analysis.get('is_in_scope', True)}")
+            logger.info(f"   Out of Scope Reason: {analysis.get('out_of_scope_reason', 'N/A')}")
             logger.info(f"   Sentiment: {analysis.get('sentiment', {})}")
             logger.info(f"   Needs De-escalation: {analysis.get('needs_de_escalation', False)}")
             logger.info(f"   Needs More Info: {analysis.get('needs_more_info', False)}")
             logger.info(f"   Missing Info: {analysis.get('missing_info', 'none')}")
+            logger.info(f"   User Refused Info: {analysis.get('user_refused_info', False)}")
+            logger.info(f"   Refused Info Type: {analysis.get('refused_info_type', 'N/A')}")
+            logger.info(f"   Cannot Proceed Reason: {analysis.get('cannot_proceed_reason', 'N/A')}")
             logger.info(f"   Tools Selected: {analysis.get('tools_to_use', [])}")
             logger.info(f"   Reasoning: {analysis.get('reasoning', 'N/A')}")
             
@@ -458,6 +520,33 @@ AVAILABLE TOOLS:
 
 Think through these steps naturally:
 
+0. SCOPE CHECK (DO THIS FIRST - CRITICAL)
+   Before anything else, determine if this query is within our support scope.
+   
+   IN-SCOPE (we CAN help):
+   - Orders: status, tracking, delivery, history
+   - Refunds, cancellations, replacements
+   - Damaged/defective products, wrong items received
+   - Return policy, shipping info, product questions
+   - Account issues, billing questions
+   - Any query related to our products/orders/services
+   
+   OUT-OF-SCOPE (we CANNOT help - NOT our domain):
+   - Utilities: electricity, water, gas, internet outages
+   - Weather, traffic, general knowledge
+   - Other companies' products/services
+   - Government services, legal/medical advice
+   - Technical support for unrelated products
+   - Random topics unrelated to orders/products
+   
+   If OUT OF SCOPE:
+   - Set is_in_scope = false
+   - Set out_of_scope_reason = what the topic is
+   - Set tools_to_use = [] (NEVER use tools for out-of-scope)
+   - Set needs_more_info = false (we don't need info for out-of-scope)
+   - Do NOT offer escalation (escalation is ONLY for in-scope issues)
+   - Response should politely decline and clarify what we CAN help with
+
 1. UNDERSTAND THE CUSTOMER
    - How are they feeling? (angry, frustrated, confused, calm, satisfied)
    - How urgent is their issue?
@@ -492,6 +581,24 @@ Think through these steps naturally:
    IMPORTANT: You CANNOT create a ticket without: order_id, customer name, and phone number. Always ask for missing info.
    
    If ALL required info is available (from current message + state), then proceed.
+
+4b. CHECK FOR USER REFUSAL TO PROVIDE INFO
+   CRITICAL: Detect if user is refusing or unable to provide required information:
+   - "I don't have my order ID" / "don't remember my order number"
+   - "I can't provide that" / "I won't share my phone number"
+   - "I don't want to give that information"
+   - "I don't have any photo/image" / "can't send a picture"
+   
+   If user REFUSES or CANNOT provide mandatory info:
+   - Set user_refused_info = true
+   - Set refused_info_type = what they refused (order_id, phone_number, image, etc.)
+   - Set cannot_proceed_reason = why this info is essential
+   - Set needs_more_info = false (they already said no)
+   - Set tools_to_use = [] (cannot proceed without required info)
+   - Response should: explain why info is needed, suggest alternatives if any, gracefully close
+   - Do NOT keep asking for the same info after explicit refusal
+   
+   Also check STATE for previous refusals - don't ask again for something user already refused.
 
 5. SELECT TOOLS (only if you have enough info)
    - Order status/tracking questions → live_information
@@ -540,6 +647,8 @@ If user's current message is JUST providing info (name, phone, etc.):
 Return your analysis as JSON:
 
 {{
+  "is_in_scope": true or false,
+  "out_of_scope_reason": "what the out-of-scope topic is, or null if in-scope",
   "intent": "brief description of what customer wants",
   "explicit_request": "what specific action customer asked for (refund/replacement/cancel/reorder/status/etc) or null if vague",
   "sentiment": {{
@@ -551,6 +660,9 @@ Return your analysis as JSON:
   "de_escalation_approach": "how to acknowledge their feelings if needed, or empty string",
   "needs_more_info": true or false,
   "missing_info": "what specific info is STILL needed (not already in state) or null if none",
+  "user_refused_info": true or false,
+  "refused_info_type": "what info user refused to provide (order_id/phone_number/image/etc) or null",
+  "cannot_proceed_reason": "why we cannot proceed without the refused info, or null",
   "context_from_history": "summary of info from conversation state: order_id, name, phone, issue, etc.",
   "pending_action_from_state": "the pending_action from conversation state or null",
   "escalation_already_confirmed": true or false,
@@ -604,12 +716,17 @@ Return your analysis as JSON:
     def _get_fallback_analysis(self, query: str) -> Dict[str, Any]:
         """Fallback analysis when parsing fails - signals error to response generator"""
         return {
+            "is_in_scope": True,
+            "out_of_scope_reason": None,
             "intent": query,
             "sentiment": {"emotion": "neutral", "intensity": "medium", "urgency": "medium"},
             "needs_de_escalation": False,
             "de_escalation_approach": "",
             "needs_more_info": False,
             "missing_info": None,
+            "user_refused_info": False,
+            "refused_info_type": None,
+            "cannot_proceed_reason": None,
             "tools_to_use": [],
             "tool_queries": {},
             "reasoning": "Fallback analysis - JSON parsing failed",
@@ -716,6 +833,11 @@ Return your analysis as JSON:
         context_from_history = analysis.get('context_from_history')
         escalation_already_confirmed = analysis.get('escalation_already_confirmed', False)
         pending_action = analysis.get('pending_action_from_state')
+        is_in_scope = analysis.get('is_in_scope', True)
+        out_of_scope_reason = analysis.get('out_of_scope_reason')
+        user_refused_info = analysis.get('user_refused_info', False)
+        refused_info_type = analysis.get('refused_info_type')
+        cannot_proceed_reason = analysis.get('cannot_proceed_reason')
         
         
         response_prompt = f"""You are a friendly, helpful customer support agent. Generate a response to help this customer.
@@ -737,6 +859,11 @@ CUSTOMER STATE:
 ANALYSIS CONTEXT:
 - Intent: {intent}
 - Explicit Request: {explicit_request if explicit_request else 'None - customer is vague about what they want'}
+- Is In Scope: {is_in_scope}
+- Out of Scope Reason: {out_of_scope_reason if out_of_scope_reason else 'N/A - query is in scope'}
+- User Refused Info: {user_refused_info}
+- Refused Info Type: {refused_info_type if refused_info_type else 'N/A'}
+- Cannot Proceed Reason: {cannot_proceed_reason if cannot_proceed_reason else 'N/A'}
 - Context from History: {context_from_history if context_from_history else 'None'}
 - Pending Action: {pending_action if pending_action else 'None'}
 - Escalation Already Confirmed: {escalation_already_confirmed}
@@ -748,6 +875,30 @@ INFORMATION FROM TOOLS:
 INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None - you have what you need'}
 
 === RESPONSE GUIDELINES ===
+
+0. OUT-OF-SCOPE HANDLING (if is_in_scope = {is_in_scope}):
+   If is_in_scope is FALSE:
+   - Politely inform the user this topic is outside your support scope
+   - Be clear but kind: "I'm sorry, but [topic] is outside what I can help with."
+   - Clarify what you CAN help with: "I'm here to assist with orders, refunds, returns, and product-related queries."
+   - Do NOT offer escalation (escalation is ONLY for in-scope issues we can't resolve)
+   - Do NOT ask follow-up questions about the out-of-scope topic
+   - If user persists, keep politely declining without frustration
+   - Optionally suggest where they might get help (e.g., "You may want to contact [appropriate service]")
+   - NEVER use any tools for out-of-scope queries
+
+0b. CANNOT PROCEED - USER REFUSED INFO (if user_refused_info = {user_refused_info}):
+   If user REFUSED to provide required information:
+   - Acknowledge their concern/situation empathetically
+   - Clearly state you CANNOT proceed without the required info: "{refused_info_type}"
+   - Explain briefly WHY it's needed: "{cannot_proceed_reason}"
+   - Offer alternatives if any exist:
+     * For order_id: "You can find it in your order confirmation email or account order history"
+     * For phone: "This is needed so our team can contact you about your issue"
+   - If no alternatives or user is firm: "I understand. Unfortunately, without [info], I'm unable to assist with this request."
+   - Do NOT keep asking for the same info after explicit refusal
+   - Do NOT escalate just because user won't provide info
+   - Offer to help with something else: "Is there anything else I can help you with?"
 
 1. LANGUAGE REQUIREMENT:
    You MUST respond in: {detected_language}
