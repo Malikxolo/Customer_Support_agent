@@ -61,8 +61,7 @@ class CustomerSupportAgent:
             "missing_info_requested": [],
             "ticket_attempted": False,
             "ticket_created": False,
-            "out_of_scope_detected": False,
-            "out_of_scope_topic": None,
+            "previous_query_was_out_of_scope": False,
             "info_refused": {},
             "times_asked_for_info": {}
         }
@@ -147,16 +146,15 @@ class CustomerSupportAgent:
                 if 'ticket' in content and ('created' in content or 'raised' in content):
                     state["ticket_created"] = True
                 
-                # Detect out-of-scope responses from bot
+                # Note if the PREVIOUS turn was out-of-scope (for context only, not instruction)
+                # This helps LLM understand conversation flow but should NOT prevent re-evaluation
                 if any(phrase in content for phrase in [
                     'outside what i can help',
                     'outside my scope',
                     'outside of my scope',
-                    'not something i can assist',
-                    'beyond my capabilities',
-                    'unable to help with'
+                    'not something i can assist'
                 ]):
-                    state["out_of_scope_detected"] = True
+                    state["previous_query_was_out_of_scope"] = True
             
             # Detect user refusals in user messages
             if role == 'user':
@@ -228,9 +226,9 @@ class CustomerSupportAgent:
         if state.get("ticket_created"):
             lines.append("TICKET STATUS: Already created")
         
-        # Out-of-scope detection
-        if state.get("out_of_scope_detected"):
-            lines.append("OUT-OF-SCOPE: Bot already identified query as out-of-scope")
+        # Previous out-of-scope context (neutral note, not instruction)
+        if state.get("previous_query_was_out_of_scope"):
+            lines.append("PREVIOUS TURN: Bot identified previous query as off-topic (evaluate current query independently)")
         
         # Info refusal tracking
         if state.get("info_refused"):
@@ -247,9 +245,9 @@ class CustomerSupportAgent:
         # Add guidance based on state
         lines.append("")
         lines.append("STATE INTERPRETATION:")
-        if state.get("out_of_scope_detected"):
-            lines.append("→ This query was already identified as OUT OF SCOPE. Keep politely declining.")
-        elif state.get("info_refused"):
+        if state.get("previous_query_was_out_of_scope"):
+            lines.append("→ Previous query was off-topic. Evaluate CURRENT query independently - user may now ask something in-scope.")
+        if state.get("info_refused"):
             refused = [k for k, v in state["info_refused"].items() if v]
             if refused:
                 lines.append(f"→ User REFUSED to provide: {', '.join(refused)}. Do NOT ask again. Explain you cannot proceed.")
@@ -498,7 +496,7 @@ Examples:
                 history_entries.append(f"{role}: {content}")
             formatted_history = "\n".join(history_entries)
         
-        # Format conversation state for prompt (Fix 2.2)
+        # Format conversation state for prompt
         state_summary = self._format_conversation_state(conv_state)
         
         analysis_prompt = f"""You are analyzing a customer support query. Use the CONVERSATION STATE to understand context and make smart decisions.
