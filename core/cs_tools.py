@@ -285,46 +285,43 @@ class RaiseTicketTool(BaseTool):
         
         logger.info("RaiseTicketTool initialized")
     
-    async def execute(self, user_id: str, subject: str, description: str,
+    async def execute(self, subject: str = None, description: str = None,
                      priority: str = "medium", category: str = "general",
-                     customerName: str = None, channel: str = "whatsapp",
+                     customerName: str = None, customerId: str = None,
                      metadata: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
         """
         Raise a support ticket
         
         Args:
-            user_id: User identifier
-            subject: Ticket subject/title
-            description: Detailed description of the issue
+            subject: Ticket subject/title (REQUIRED)
+            description: Detailed description of the issue (REQUIRED)
             priority: Ticket priority - "low", "medium", "high", "urgent"
-            category: Ticket category - "technical", "billing", "general", "product"
-            customerName: Name of the customer
-            channel: Communication channel - "whatsapp" or "website"
+            category: Ticket category - "damaged_product", "refund", "cancellation", "wrong_item", "delivery_issue", "technical", "billing", "general"
+            customerName: Name of the customer (REQUIRED)
+            customerId: Customer's phone number (REQUIRED)
             metadata: Additional metadata (order_id, product_id, etc.)
         """
         self._record_usage()
-        logger.info(f"Raising ticket: user={user_id}, priority={priority}, category={category}")
+        
+        # Channel is always whatsapp
+        channel = "whatsapp"
+        
+        logger.info(f"Raising ticket: customerId={customerId}, customerName={customerName}, priority={priority}, category={category}")
         
         try:
             if not self.session:
                 self.session = aiohttp.ClientSession()
             
-            # TODO: Implement ticket creation logic
-            # Example implementation:
-            # - Validate input fields
-            # - Call ticketing system API (Zendesk, Freshdesk, custom)
-            # - Generate ticket ID
-            # - Send confirmation
-            # - Return ticket details
-            
             ticket = await self._create_ticket(
-                user_id, subject, description, priority, category, customerName, channel, metadata
+                customerId, subject, description, priority, category, customerName, channel, metadata
             )
             
             return {
                 "success": True,
                 "ticket_id": ticket.get("ticket_id") or ticket.get("id"),
                 "ticket": ticket,
+                "category": category,
+                "priority": priority,
                 "message": "Ticket created successfully"
             }
             
@@ -333,26 +330,29 @@ class RaiseTicketTool(BaseTool):
             return {
                 "success": False,
                 "error": f"Ticket creation failed: {str(e)}",
-                "user_id": user_id
+                "customerId": customerId
             }
     
-    async def _create_ticket(self, user_id: str, subject: str, description: str,
+    async def _create_ticket(self, customerId: str, subject: str, description: str,
                            priority: str, category: str, customerName: str = None, 
                            channel: str = "whatsapp", metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """Create ticket in ticketing system"""
         
-        logger.info(f"Creating ticket for user {user_id}: {subject}")
+        logger.info(f"Creating ticket for customer {customerName} ({customerId}): {subject}")
+        
+        # Build tags based on category
+        tags = [category] if category else ["general"]
         
         # Construct the API request body
         body = {
             "subject": subject,
             "description": description,
-            "customerId": user_id,
-            "customerName": customerName or "Unknown",
+            "customerId": customerId,  # Phone number
+            "customerName": customerName,
             "status": "open",
             "priority": priority,
-            "tags": [category],
-            "channel": channel,
+            "tags": tags,
+            "channel": "whatsapp",  # Always whatsapp
             "assignee": None
         }
         

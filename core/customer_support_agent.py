@@ -18,6 +18,7 @@ AVAILABLE TOOLS:
 import json
 import logging
 import asyncio
+import re
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dotenv import load_dotenv
@@ -42,6 +43,167 @@ class CustomerSupportAgent:
         self._worker_started = False
         
         logger.info(f"CustomerSupportAgent initialized with tools: {self.available_tools}")
+    
+    def _extract_conversation_state(self, chat_history: List[Dict] = None) -> Dict[str, Any]:
+        """Extract conversation state from chat history to help LLM maintain context"""
+        state = {
+            "collected_info": {
+                "order_id": None,
+                "customer_name": None,
+                "phone_number": None,
+                "issue_type": None,
+                "issue_description": None
+            },
+            "pending_action": None,
+            "escalation_offered": False,
+            "escalation_confirmed": False,
+            "last_bot_question": None,
+            "missing_info_requested": [],
+            "ticket_attempted": False,
+            "ticket_created": False
+        }
+        
+        if not chat_history:
+            return state
+        
+        # Patterns to detect in conversation
+        for i, msg in enumerate(chat_history):
+            role = msg.get('role', '').lower()
+            content = msg.get('content', '').lower()
+            original_content = msg.get('content', '')
+            
+            if role == 'user':
+                # Extract order ID patterns
+                order_match = re.search(r'order\s*(?:id|#|number)?\s*[:#]?\s*(\d+)', content)
+                if order_match:
+                    state["collected_info"]["order_id"] = order_match.group(1)
+                
+                # Extract phone number (10 digits)
+                phone_match = re.search(r'\b(\d{10})\b', content)
+                if phone_match:
+                    state["collected_info"]["phone_number"] = phone_match.group(1)
+                
+                # Extract name patterns
+                name_patterns = [
+                    r'(?:my name is|name is|i am|i\'m)\s+([A-Za-z]+)',
+                    r'name\s*[:\-]?\s*([A-Za-z]+)'
+                ]
+                for pattern in name_patterns:
+                    name_match = re.search(pattern, content, re.IGNORECASE)
+                    if name_match:
+                        state["collected_info"]["customer_name"] = name_match.group(1).title()
+                        break
+                
+                # Detect issue types
+                if any(word in content for word in ['damaged', 'broken', 'defective', 'not working']):
+                    state["collected_info"]["issue_type"] = "damaged_product"
+                elif any(word in content for word in ['refund', 'money back']):
+                    state["collected_info"]["issue_type"] = "refund"
+                elif any(word in content for word in ['cancel', 'cancellation']):
+                    state["collected_info"]["issue_type"] = "cancellation"
+                elif any(word in content for word in ['wrong item', 'wrong product', 'different item']):
+                    state["collected_info"]["issue_type"] = "wrong_item"
+                
+                # Detect escalation confirmation
+                if any(phrase in content for phrase in ['yes', 'please escalate', 'escalate it', 'escalate this', 'talk to agent', 'human agent', 'connect me']):
+                    # Check if bot previously offered escalation
+                    if state["escalation_offered"]:
+                        state["escalation_confirmed"] = True
+                
+            elif role == 'assistant':
+                # Detect if bot offered escalation
+                if any(phrase in content for phrase in [
+                    'would you like me to escalate',
+                    'would you like to escalate',
+                    'want me to escalate',
+                    'escalate this to our support team',
+                    'connect you with a human agent',
+                    'escalate to a human agent'
+                ]):
+                    state["escalation_offered"] = True
+                    state["last_bot_question"] = "offered_escalation"
+                
+                # Detect if bot asked for specific info
+                if 'name' in content and ('provide' in content or 'share' in content or 'tell' in content or '?' in content):
+                    state["missing_info_requested"].append("customer_name")
+                    state["last_bot_question"] = "asked_for_info"
+                if 'phone' in content and ('provide' in content or 'share' in content or 'tell' in content or '?' in content):
+                    state["missing_info_requested"].append("phone_number")
+                    state["last_bot_question"] = "asked_for_info"
+                if 'order' in content and ('id' in content or 'number' in content) and '?' in content:
+                    state["missing_info_requested"].append("order_id")
+                    state["last_bot_question"] = "asked_for_info"
+                
+                # Detect ticket creation attempt
+                if 'technical issue' in content or 'try again' in content:
+                    state["ticket_attempted"] = True
+                if 'ticket' in content and ('created' in content or 'raised' in content):
+                    state["ticket_created"] = True
+        
+        # Determine pending action
+        if state["escalation_confirmed"] and not state["ticket_created"]:
+            state["pending_action"] = "raise_ticket"
+        elif state["collected_info"]["issue_type"] in ["refund", "cancellation", "damaged_product", "wrong_item"]:
+            if not state["escalation_offered"]:
+                state["pending_action"] = "offer_escalation"
+            elif state["escalation_confirmed"]:
+                state["pending_action"] = "raise_ticket"
+        
+        return state
+    
+    def _format_conversation_state(self, state: Dict[str, Any]) -> str:
+        """Format conversation state into readable text for the analysis prompt"""
+        lines = []
+        
+        # Collected info
+        collected = state.get("collected_info", {})
+        collected_items = []
+        if collected.get("order_id"):
+            collected_items.append(f"order_id={collected['order_id']}")
+        if collected.get("customer_name"):
+            collected_items.append(f"customer_name={collected['customer_name']}")
+        if collected.get("phone_number"):
+            collected_items.append(f"phone={collected['phone_number']}")
+        if collected.get("issue_type"):
+            collected_items.append(f"issue_type={collected['issue_type']}")
+        if collected.get("issue_description"):
+            collected_items.append(f"issue_desc={collected['issue_description'][:50]}")
+        
+        lines.append(f"COLLECTED INFO: {', '.join(collected_items) if collected_items else 'None yet'}")
+        
+        # Pending action
+        pending = state.get("pending_action")
+        lines.append(f"PENDING ACTION: {pending if pending else 'None'}")
+        
+        # Escalation status
+        lines.append(f"ESCALATION OFFERED BY BOT: {state.get('escalation_offered', False)}")
+        lines.append(f"ESCALATION CONFIRMED BY USER: {state.get('escalation_confirmed', False)}")
+        
+        # What bot asked for
+        if state.get("missing_info_requested"):
+            lines.append(f"BOT PREVIOUSLY ASKED FOR: {', '.join(state['missing_info_requested'])}")
+        
+        # Last bot question type
+        if state.get("last_bot_question"):
+            lines.append(f"LAST BOT ACTION: {state['last_bot_question']}")
+        
+        # Ticket status
+        if state.get("ticket_attempted"):
+            lines.append("TICKET ATTEMPT: Previous attempt failed (missing info)")
+        if state.get("ticket_created"):
+            lines.append("TICKET STATUS: Already created")
+        
+        # Add guidance based on state
+        lines.append("")
+        lines.append("STATE INTERPRETATION:")
+        if state.get("escalation_confirmed") and pending == "raise_ticket":
+            lines.append("→ User ALREADY confirmed escalation. Proceed with raise_ticket if you have all required info.")
+        elif state.get("escalation_offered") and not state.get("escalation_confirmed"):
+            lines.append("→ Bot offered escalation but user hasn't confirmed yet.")
+        elif state.get("missing_info_requested"):
+            lines.append(f"→ Bot asked for {', '.join(state['missing_info_requested'])}. Check if user provided it.")
+        
+        return "\n".join(lines)
     
     def _get_tool_descriptions(self) -> str:
         """Get formatted tool descriptions for LLM prompts"""
@@ -73,9 +235,9 @@ class CustomerSupportAgent:
             },
             "raise_ticket": {
                 "purpose": "Create support ticket for escalation - an agent will be assigned in backend",
-                "use_when": "After gathering all info (order ID, reason, photos if applicable) for: refund requests, cancellations, replacements, complex issues, or issues needing research",
+                "use_when": "After gathering all info (order ID, customer name, phone number, reason) for: refund requests, cancellations, replacements, complex issues, or issues needing research",
                 "important": "NEVER create ticket just because user says 'talk to agent' - first ask what their issue is. Gather all info before creating ticket.",
-                "required_params": "subject (brief title), description (full issue details with order_id if available)"
+                "required_params": "subject, description, customerName, customerId (phone number), category (based on issue type: damaged_product, refund, cancellation, wrong_item, delivery_issue, technical, billing, general)"
             }
         }
         
@@ -258,8 +420,11 @@ Examples:
             }
     
     async def _analyze_query(self, query: str, chat_history: List[Dict] = None) -> Dict[str, Any]:
-        """Analyze customer query using LLM intelligence"""
+        """Analyze customer query using LLM intelligence with conversation state tracking"""
         current_date = datetime.now().strftime("%B %d, %Y")
+        
+        # Extract conversation state from history (Fix 2.1)
+        conv_state = self._extract_conversation_state(chat_history)
         
         # Format chat history for embedding in prompt
         formatted_history = ""
@@ -271,13 +436,19 @@ Examples:
                 history_entries.append(f"{role}: {content}")
             formatted_history = "\n".join(history_entries)
         
-        analysis_prompt = f"""You are analyzing a customer support query. Understand what the customer needs and decide how to help them.
+        # Format conversation state for prompt (Fix 2.2)
+        state_summary = self._format_conversation_state(conv_state)
+        
+        analysis_prompt = f"""You are analyzing a customer support query. Use the CONVERSATION STATE to understand context and make smart decisions.
 
 TODAY'S DATE: {current_date}
 
 CUSTOMER QUERY: {query}
 
-CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+=== CONVERSATION STATE (CRITICAL - USE THIS) ===
+{state_summary}
+
+CONVERSATION HISTORY (raw messages for additional context):
 {formatted_history if formatted_history else 'No previous conversation.'}
 
 AVAILABLE TOOLS:
@@ -292,37 +463,44 @@ Think through these steps naturally:
    - How urgent is their issue?
    - If very angry/frustrated with high intensity → they need de-escalation (empathy first)
 
-2. IDENTIFY THEIR NEED
-   - What do they actually want? (refund, order status, information, help with issue, etc.)
-   - Is this a follow-up to previous conversation? Check history for context.
+2. CHECK CONVERSATION STATE
+   - What info has ALREADY been collected? (order_id, name, phone, issue type)
+   - Is there a PENDING ACTION? (escalation confirmed but not executed?)
+   - Did bot already offer escalation? Did user confirm?
+   - What was the last thing bot asked for?
 
-3. DO YOU NEED MORE INFORMATION?
-   FIRST: Check conversation history for info already provided.
+3. IDENTIFY THEIR NEED
+   - What do they actually want? (refund, order status, information, help with issue, etc.)
+   - Is this a follow-up providing info that was requested?
+   - IMPORTANT: If user is providing info (name, phone, etc.) that was previously requested,
+     this is a CONTINUATION of the previous action, not a new request.
+
+4. DO YOU NEED MORE INFORMATION?
+   FIRST: Check CONVERSATION STATE for info already provided.
    
-   CRITICAL: If you previously asked for MULTIPLE pieces of info, verify ALL were provided.
-   - If you asked for "order ID AND reason" → user must provide BOTH, not just one
-   - If user only provided partial info → still mark needs_more_info=true for the remaining items
-   - Do NOT proceed until you have everything you asked for
+   CRITICAL: Combine info from current message + conversation state.
+   - If state shows order_id=89 and user now gives name+phone → you have everything!
+   - Don't ask for info that's already in the state.
    
    What's needed for different requests:
    - For refund/cancellation → order ID + reason (need BOTH)
    - For damaged item → order ID + photo + description of damage (need ALL)
    - For wrong item → order ID + photo + what they received vs expected
-   - For escalation/talk to agent → order ID + clear issue description (need BOTH)
-   - For "I want to talk to agent" with NO context → what issue they're facing + order ID
+   - For escalation/talk to agent → order ID + customer name + phone number + clear issue description (need ALL)
+   - For "I want to talk to agent" with NO context → what issue they're facing + order ID + customer name + phone number
    
-   IMPORTANT: You CANNOT create a ticket without order_id. Always ask for it if missing.
+   IMPORTANT: You CANNOT create a ticket without: order_id, customer name, and phone number. Always ask for missing info.
    
-   If ALL required info is available (from current message + history), then proceed.
+   If ALL required info is available (from current message + state), then proceed.
 
-4. SELECT TOOLS (only if you have enough info)
+5. SELECT TOOLS (only if you have enough info)
    - Order status/tracking questions → live_information
    - Policy/FAQ questions → knowledge_base  
    - Refund/cancel/replace requests → verification ONLY (then offer agent in response, don't auto-assign)
    - Damaged product with photo → image_analysis + verification (then offer agent in response)
    - Non-urgent issue needing research → raise_ticket
 
-5. SPECIAL CASES
+6. SPECIAL CASES
    - Customer asks for human BUT has already explained issue and we couldn't help → raise_ticket
    - Customer asks for human WITHOUT explaining issue → Ask what's wrong first (needs_more_info=true)
    - High-risk verification result → raise_ticket
@@ -336,22 +514,28 @@ Information-gathering tools (can run together):
 Commitment tools (require user confirmation FIRST):
    - raise_ticket → ONLY use when user explicitly confirms they want escalation. Creates ticket and agent is assigned in backend.
    - order_action → ONLY after verification passes
-   
-ABSOLUTE RULE FOR RAISE_TICKET (HARD CONSTRAINT):
 
-raise_ticket is NOT a problem-solving step.
-raise_ticket is a permission-based action.
+=== SMART ESCALATION DETECTION (FIX FOR DOUBLE-ASKING) ===
 
-You MUST NOT include "raise_ticket" in tools_to_use
-unless the user has explicitly requested or confirmed
-that they want to escalate to a human agent
-in their CURRENT message.
+CHECK THE CONVERSATION STATE:
+- If escalation_offered=True AND escalation_confirmed=True → User ALREADY gave consent!
+- If pending_action="raise_ticket" → We should execute raise_ticket now, not ask again.
 
-If escalation seems appropriate but the user has NOT confirmed:
-- Do NOT select raise_ticket
-- Ask the user if they want to escalate this to our support team
-- Wait for their response in the next turn
+DO NOT ask "would you like me to escalate?" if:
+1. Bot already asked this in a previous turn (escalation_offered=True)
+2. AND user confirmed (escalation_confirmed=True or user said yes/please/escalate in current message)
 
+If escalation is already confirmed:
+- Include "raise_ticket" in tools_to_use
+- Fill in tool_parameters with ALL collected info from state + current message
+
+=== HANDLING INFO-PROVIDING MESSAGES ===
+
+If user's current message is JUST providing info (name, phone, etc.):
+- Check what action was pending (from state)
+- If pending_action="raise_ticket" and now we have all info → execute raise_ticket
+- Do NOT treat this as a new conversation or ask "how can I help?"
+- CONTINUE the pending action with the new info
 
 Return your analysis as JSON:
 
@@ -366,8 +550,10 @@ Return your analysis as JSON:
   "needs_de_escalation": true or false,
   "de_escalation_approach": "how to acknowledge their feelings if needed, or empty string",
   "needs_more_info": true or false,
-  "missing_info": "what specific info is needed (order_id, photo, reason, details) or null if none",
-  "context_from_history": "any relevant info already provided in earlier messages (order_id, reason, etc) or null",
+  "missing_info": "what specific info is STILL needed (not already in state) or null if none",
+  "context_from_history": "summary of info from conversation state: order_id, name, phone, issue, etc.",
+  "pending_action_from_state": "the pending_action from conversation state or null",
+  "escalation_already_confirmed": true or false,
   "tools_to_use": ["tool1", "tool2"] or empty array if no tools needed,
   "tool_queries": {{
     "tool_name": "specific query to pass to this tool"
@@ -375,10 +561,14 @@ Return your analysis as JSON:
   "tool_parameters": {{
     "raise_ticket": {{
       "subject": "brief ticket title based on issue",
-      "description": "detailed description including order_id, issue, customer request"
+      "description": "detailed description including order_id, issue, customer request",
+      "customerName": "customer's name from state OR current message",
+      "customerId": "customer's phone number from state OR current message",
+      "category": "one of: damaged_product, refund, cancellation, wrong_item, delivery_issue, technical, billing, general - based on issue type",
+      "priority": "low/medium/high/urgent based on urgency"
     }}
   }},
-  "reasoning": "your decision logic: what user wants, why you chose these tools, what should happen next"
+  "reasoning": "your decision logic: what state shows, what user provided now, why you chose these tools, what should happen next"
 }}"""
 
         try:
@@ -392,6 +582,18 @@ Return your analysis as JSON:
             json_str = self._extract_json(response)
             result = json.loads(json_str)
             
+            # Merge conversation state info into tool_parameters if raise_ticket is selected
+            if 'raise_ticket' in result.get('tools_to_use', []):
+                tool_params = result.get('tool_parameters', {}).get('raise_ticket', {})
+                # Fill from state if not provided by LLM
+                if not tool_params.get('customerName') or tool_params.get('customerName') in ['null', None]:
+                    tool_params['customerName'] = conv_state['collected_info'].get('customer_name')
+                if not tool_params.get('customerId') or tool_params.get('customerId') in ['null', None]:
+                    tool_params['customerId'] = conv_state['collected_info'].get('phone_number')
+                if 'raise_ticket' not in result.get('tool_parameters', {}):
+                    result['tool_parameters'] = result.get('tool_parameters', {})
+                result['tool_parameters']['raise_ticket'] = tool_params
+            
             logger.info(f"✅ Analysis complete: {result.get('intent', 'Unknown intent')}")
             return result
             
@@ -400,7 +602,7 @@ Return your analysis as JSON:
             return self._get_fallback_analysis(query)
     
     def _get_fallback_analysis(self, query: str) -> Dict[str, Any]:
-        """Fallback analysis when parsing fails"""
+        """Fallback analysis when parsing fails - signals error to response generator"""
         return {
             "intent": query,
             "sentiment": {"emotion": "neutral", "intensity": "medium", "urgency": "medium"},
@@ -410,7 +612,9 @@ Return your analysis as JSON:
             "missing_info": None,
             "tools_to_use": [],
             "tool_queries": {},
-            "reasoning": "Fallback analysis - JSON parsing failed"
+            "reasoning": "Fallback analysis - JSON parsing failed",
+            "is_fallback": True,
+            "fallback_response": "I'm having a bit of trouble understanding your request. Could you please rephrase that or tell me more about what you need help with?"
         }
 
     async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
@@ -433,6 +637,29 @@ Return your analysis as JSON:
             
             # Get tool-specific parameters if provided by LLM
             extra_params = tool_parameters.get(tool, {})
+            
+            # Validate required fields for raise_ticket
+            if tool == "raise_ticket":
+                missing_fields = []
+                if not extra_params.get('customerName') or extra_params.get('customerName') in ['null', 'Unknown', None, '']:
+                    missing_fields.append('customer name')
+                if not extra_params.get('customerId') or extra_params.get('customerId') in ['null', None, '']:
+                    missing_fields.append('phone number')
+                if not extra_params.get('subject') or extra_params.get('subject') in ['null', None, '']:
+                    missing_fields.append('issue subject')
+                if not extra_params.get('description') or extra_params.get('description') in ['null', None, '']:
+                    missing_fields.append('issue description')
+                
+                if missing_fields:
+                    # Fix 1.1: Return as clarification need, not error
+                    results[tool_key] = {
+                        "status": "needs_clarification",
+                        "success": False,
+                        "missing_fields": missing_fields,
+                        "clarification_needed": f"To create your support ticket, I need: {', '.join(missing_fields)}"
+                    }
+                    logger.warning(f"⚠️ raise_ticket needs clarification - missing: {missing_fields}")
+                    continue
             
             logger.info(f"🔧 Queueing {tool}: '{tool_query[:50]}...'")
             task = self.tool_manager.execute_tool(tool, query=tool_query, user_id=user_id, **extra_params)
@@ -472,6 +699,11 @@ Return your analysis as JSON:
         logger.info(tool_data)
         logger.info("="*60)
         
+        # Check for fallback analysis (Fix 1.4)
+        if analysis.get('is_fallback'):
+            logger.warning("⚠️ Using fallback response due to analysis failure")
+            return analysis.get('fallback_response', "I'm having trouble processing your request. Could you please rephrase that?")
+        
         # Extract analysis data
         sentiment = analysis.get('sentiment', {})
         needs_de_escalation = analysis.get('needs_de_escalation', False)
@@ -482,6 +714,8 @@ Return your analysis as JSON:
         explicit_request = analysis.get('explicit_request')
         reasoning = analysis.get('reasoning', '')
         context_from_history = analysis.get('context_from_history')
+        escalation_already_confirmed = analysis.get('escalation_already_confirmed', False)
+        pending_action = analysis.get('pending_action_from_state')
         
         
         response_prompt = f"""You are a friendly, helpful customer support agent. Generate a response to help this customer.
@@ -504,6 +738,8 @@ ANALYSIS CONTEXT:
 - Intent: {intent}
 - Explicit Request: {explicit_request if explicit_request else 'None - customer is vague about what they want'}
 - Context from History: {context_from_history if context_from_history else 'None'}
+- Pending Action: {pending_action if pending_action else 'None'}
+- Escalation Already Confirmed: {escalation_already_confirmed}
 - Reasoning: {reasoning}
 
 INFORMATION FROM TOOLS:
@@ -534,8 +770,10 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
    - If ticket created → give them the ticket number and confirm an agent will reach out
    - If order/policy info retrieved → answer their question directly
 
-5. HANDLE TOOL ERRORS:
-   - If any tool shows "Error" or failed → acknowledge the issue
+5. HANDLE TOOL RESULTS:
+   - If tool shows "CLARIFICATION NEEDED" → This is NOT an error! Ask for the missing info naturally.
+     Example: "To create your ticket, I just need your name and phone number."
+   - If any tool shows "Error" or failed → acknowledge a technical issue
    - For image_analysis error → politely ask customer to share the image again (it may not have uploaded properly)
    - Don't pretend the tool worked if it failed
    - IMPORTANT: If image_analysis failed, focus ONLY on getting a proper image. Do NOT offer agent connection yet.
@@ -547,11 +785,19 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
    - If TICKET CREATED appears in tool results:
      → Ticket is created. Confirm an agent will reach out shortly with the ticket reference.
    
-   - If raise_ticket shows ERROR or failed:
-     → Do NOT say you escalated or created a ticket. That's a lie.
-     → Apologize for the technical issue and say you'll try again, or ask for any missing info.
+   - If CLARIFICATION NEEDED appears in tool results:
+     → This means we tried to create ticket but need more info from customer.
+     → Ask ONLY for the specific missing info listed. Be natural: "I just need your name and phone number to create the ticket."
+     → Do NOT say "technical issue" - this is normal info gathering.
    
-   - If NO ticket created yet AND verification was done:
+   - If raise_ticket shows actual ERROR (not clarification):
+     → Apologize for the technical issue and say you'll try again.
+   
+   - If escalation_already_confirmed = True but no ticket created:
+     → User already confirmed they want escalation. Do NOT ask again.
+     → Either create the ticket (if we have info) or ask for the specific missing info.
+   
+   - If NO ticket created yet AND verification was done AND escalation NOT yet offered:
      → ASK user: "Would you like me to escalate this to our support team? An agent will reach out to help with your [refund/replacement/etc]."
      → Wait for their confirmation before creating ticket.
    
@@ -559,7 +805,7 @@ INFORMATION STILL NEEDED FROM CUSTOMER: {missing_info if missing_info else 'None
      → Ask what they need help with, or if just sharing feedback.
    
    - If needs_more_info = True:
-     → Do NOT offer escalation. Just ask for the missing info.
+     → Ask for the missing info. If escalation is pending, explain it's needed for the ticket.
 
 7. BOT LIMITATIONS:
    - Bot CANNOT process refunds, cancellations, or replacements directly
@@ -609,6 +855,17 @@ Generate your response:"""
             # Skip failed results
             if not isinstance(result, dict):
                 continue
+            
+            # Fix 1.1: Handle clarification needs differently from errors
+            if result.get('status') == 'needs_clarification':
+                missing = result.get('missing_fields', [])
+                clarification = result.get('clarification_needed', '')
+                formatted.append(f"📋 CLARIFICATION NEEDED FOR TICKET:")
+                formatted.append(f"   Missing information: {', '.join(missing)}")
+                formatted.append(f"   → Ask the customer for: {clarification}")
+                formatted.append(f"   Note: This is NOT an error - just need more info from customer")
+                continue
+            
             if result.get('error'):
                 formatted.append(f"⚠️ {tool_key}: Error - {result.get('error')}")
                 continue
